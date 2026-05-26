@@ -1,4 +1,5 @@
 from fastmcp import FastMCP
+from typing import Any
 import httpx
 import json
 
@@ -15,27 +16,35 @@ def ping() -> str:
 
 
 @mcp.tool
-async def meta_tool(tool_name: str, arguments_json: str = "{}") -> str:
+async def meta_tool(tool_name: str, arguments: Any = None) -> str:
     """Execute any tool stored in the Postgres tool registry by name.
 
-    This is the single entry point for all 1100+ custom tools.
+    This is the single entry point for all custom tools. When a user asks
+    you to use a specific tool, call this with the tool's name and any
+    required arguments.
 
     Args:
-        tool_name: Name of the tool to run exactly as stored in Postgres.
-        arguments_json: A JSON string of key/value pairs the tool needs.
-            Examples: '{"module": "mcp"}' or '{"query": "health", "limit": 3}'
-            Pass '{}' or omit if the tool needs no arguments.
+        tool_name: Name of the tool to run, exactly as stored in Postgres.
+        arguments: Key/value pairs the tool needs. Can be a dict or a JSON
+            string. Pass null or omit if none required.
     """
-    try:
-        arguments = json.loads(arguments_json) if arguments_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return json.dumps({"status": "error", "error": f"Invalid JSON in arguments_json: {arguments_json}"})
+    if arguments is None:
+        args = {}
+    elif isinstance(arguments, str):
+        try:
+            args = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+    elif isinstance(arguments, dict):
+        args = arguments
+    else:
+        args = {}
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             r = await client.post(
                 MILLER_URL,
-                json={"tool_name": tool_name, "arguments": arguments},
+                json={"tool_name": tool_name, "arguments": args},
                 headers={
                     "X-API-Key": MILLER_KEY,
                     "Content-Type": "application/json",
@@ -49,6 +58,6 @@ async def meta_tool(tool_name: str, arguments_json: str = "{}") -> str:
                 })
             return r.text
     except httpx.TimeoutException:
-        return json.dumps({"status": "error", "error": "Cloud Run request timed out after 120s"})
+        return json.dumps({"status": "error", "error": "Request timed out after 120s"})
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)})
