@@ -3,7 +3,7 @@ import httpx
 
 mcp = FastMCP("MillerIQ")
 
-MILLER_URL = "https://miller-mcp-db-146372550543.us-central1.run.app/execute"
+MILLER_URL = "https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute"
 MILLER_KEY = "miller-techstack-2026"
 
 
