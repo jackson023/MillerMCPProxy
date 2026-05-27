@@ -36,7 +36,7 @@ from fastmcp.server.middleware.logging import LoggingMiddleware
 # CONFIGURATION
 # ============================================================================
 
-CLOUD_RUN_URL = "https://miller-mcp-db-146372550543.us-central1.run.app"
+CLOUD_RUN_URL = "https://miller-mcp-db-v3-146372550543.us-central1.run.app"
 API_KEY = "miller-techstack-2026"
 
 # Timeouts
