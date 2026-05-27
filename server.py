@@ -1,373 +1,461 @@
 """
-Miller IQ Platform — Horizon MCP Gateway
-==========================================
-Enterprise-grade MCP transport layer with resilience.
+Miller MCP Gateway — Streamable HTTP transport, direct AlloyDB executor.
 
-This is the ONLY entry point for Claude.ai into the Miller IQ Platform.
-Horizon handles MCP protocol, OAuth, and session management.
-
-Resilience layers (using FastMCP native middleware + custom):
-    1. ErrorHandlingMiddleware  — catches all exceptions, structured error responses
-    2. RateLimitingMiddleware   — protects against request floods
-    3. TimingMiddleware         — performance monitoring on every call
-    4. LoggingMiddleware        — structured logging for all MCP traffic
-    5. CircuitBreakerMiddleware — custom: stops hammering broken Cloud Run backend
-    6. Timeout enforcement      — 30s max via httpx, clean errors on breach
-    7. Retry on 503             — one retry with backoff for cold starts
-
-Design principle: Horizon is infrastructure. Zero business logic.
+Single POST /mcp endpoint implements the MCP 2025-03-26 Streamable HTTP spec.
+Connects directly to AlloyDB, reads tool_registry, exec()s tools.
+No FastMCP, no middleware, no proxy hop.
 """
 
 import asyncio
+import inspect
 import json
-import time
-from typing import Any, Dict, Optional
+import logging
+import os
+import re as _iq_re
+import datetime as _iq_dt
+import traceback
+import uuid
+from typing import Any, Dict
 
+import asyncpg
 import httpx
-from fastmcp import FastMCP
-from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
-from fastmcp.server.middleware.rate_limiting import RateLimitingMiddleware
-from fastmcp.server.middleware.timing import TimingMiddleware
-from fastmcp.server.middleware.logging import LoggingMiddleware
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("miller-mcp-gateway")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Miller MCP Gateway", docs_url=None, redoc_url=None)
+
+# ---------------------------------------------------------------------------
+# Database pool (AlloyDB direct)
+# ---------------------------------------------------------------------------
+db_pool: asyncpg.Pool | None = None
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-CLOUD_RUN_URL = "https://miller-mcp-db-v3-146372550543.us-central1.run.app"
-API_KEY = "miller-techstack-2026"
-
-# Timeouts
-EXECUTE_TIMEOUT = 30.0        # Max seconds to wait for /execute
-HEALTH_CHECK_TIMEOUT = 5.0    # Max seconds for health probe
-RETRY_DELAY = 1.0             # Seconds before retry on 503
-
-# Circuit breaker
-CB_FAILURE_THRESHOLD = 3      # Failures before circuit opens
-CB_RECOVERY_TIMEOUT = 30.0    # Seconds before trying again
-CB_HEALTH_INTERVAL = 15.0     # Seconds between background health checks
+@app.on_event("startup")
+async def _startup():
+    global db_pool
+    dsn = os.environ["DATABASE_URL"]
+    # asyncpg needs postgresql:// not postgresql+asyncpg://
+    if "+asyncpg" in dsn:
+        dsn = dsn.replace("postgresql+asyncpg", "postgresql")
+    db_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=120)
+    logger.info("DB pool ready — connected to AlloyDB")
 
 
-# ============================================================================
-# CIRCUIT BREAKER STATE
-# ============================================================================
-
-class CircuitState:
-    """
-    Three states: CLOSED (normal), OPEN (blocking), HALF_OPEN (probing).
-    Shared across all requests via module-level singleton.
-    """
-
-    def __init__(self, failure_threshold: int, recovery_timeout: float):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.state = "CLOSED"
-        self.failure_count = 0
-        self.last_failure_time = 0.0
-        self.last_success_time = time.monotonic()
-
-    def can_execute(self) -> bool:
-        if self.state == "CLOSED":
-            return True
-        if self.state == "OPEN":
-            if time.monotonic() - self.last_failure_time >= self.recovery_timeout:
-                self.state = "HALF_OPEN"
-                return True
-            return False
-        if self.state == "HALF_OPEN":
-            return True
-        return False
-
-    def record_success(self) -> None:
-        self.failure_count = 0
-        self.state = "CLOSED"
-        self.last_success_time = time.monotonic()
-
-    def record_failure(self) -> None:
-        self.failure_count += 1
-        self.last_failure_time = time.monotonic()
-        if self.failure_count >= self.failure_threshold:
-            self.state = "OPEN"
-
-    def status(self) -> dict:
-        return {
-            "state": self.state,
-            "failure_count": self.failure_count,
-            "failure_threshold": self.failure_threshold,
-            "seconds_since_last_success": round(
-                time.monotonic() - self.last_success_time, 1
-            ),
-            "seconds_since_last_failure": (
-                round(time.monotonic() - self.last_failure_time, 1)
-                if self.last_failure_time > 0 else None
-            ),
-        }
+@app.on_event("shutdown")
+async def _shutdown():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        logger.info("DB pool closed")
 
 
-circuit = CircuitState(
-    failure_threshold=CB_FAILURE_THRESHOLD,
-    recovery_timeout=CB_RECOVERY_TIMEOUT,
+# ---------------------------------------------------------------------------
+# Universal Type Coercion (copied exactly from miller-mcp-db main.py)
+# ---------------------------------------------------------------------------
+_IQ_NULL = (None, "", "null", "undefined", "none", "None")
+
+_IQ_SCHEMA_FN = {
+    "integer": lambda v: int(v) if v not in _IQ_NULL else None,
+    "number": lambda v: float(v) if v not in _IQ_NULL else None,
+    "boolean": lambda v: (
+        v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+    )
+    if v not in _IQ_NULL
+    else None,
+    "string": lambda v: str(v) if v is not None else None,
+    "array": lambda v: (json.loads(v) if isinstance(v, str) else v)
+    if v is not None
+    else None,
+    "object": lambda v: (json.loads(v) if isinstance(v, str) else v)
+    if v is not None
+    else None,
+}
+
+_IQ_INT_PAT = _iq_re.compile(
+    r"(_id|_ids|_count|_limit|_offset|_page|_position|_order|_version|sort_order|^id$|^ids$)$",
+    _iq_re.I,
 )
+_IQ_FLOAT_PAT = _iq_re.compile(
+    r"(_pct|_percent|_score|_rate|_amount|_value|_price|_weight)$", _iq_re.I
+)
+_IQ_BOOL_PAT = _iq_re.compile(r"^(is_|has_|can_|show_|enable_|allow_)", _iq_re.I)
+_IQ_CAST_RE = _iq_re.compile(r"\$(\d+)::(\w+)", _iq_re.I)
+_IQ_CAST_FN = {
+    "bigint": lambda v: int(v) if v not in _IQ_NULL else None,
+    "integer": lambda v: int(v) if v not in _IQ_NULL else None,
+    "int": lambda v: int(v) if v not in _IQ_NULL else None,
+    "int4": lambda v: int(v) if v not in _IQ_NULL else None,
+    "int8": lambda v: int(v) if v not in _IQ_NULL else None,
+    "smallint": lambda v: int(v) if v not in _IQ_NULL else None,
+    "float": lambda v: float(v) if v not in _IQ_NULL else None,
+    "float4": lambda v: float(v) if v not in _IQ_NULL else None,
+    "float8": lambda v: float(v) if v not in _IQ_NULL else None,
+    "numeric": lambda v: float(v) if v not in _IQ_NULL else None,
+    "text": lambda v: str(v) if v is not None else None,
+    "varchar": lambda v: str(v) if v is not None else None,
+    "boolean": lambda v: (
+        v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+    )
+    if v not in _IQ_NULL
+    else None,
+    "bool": lambda v: (
+        v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+    )
+    if v not in _IQ_NULL
+    else None,
+    "date": lambda v: _iq_dt.date.fromisoformat(str(v)[:10])
+    if v not in _IQ_NULL
+    else None,
+    "timestamp": lambda v: _iq_dt.datetime.fromisoformat(str(v))
+    if v not in _IQ_NULL
+    else None,
+    "timestamptz": lambda v: _iq_dt.datetime.fromisoformat(str(v))
+    if v not in _IQ_NULL
+    else None,
+    "jsonb": lambda v: json.dumps(v) if not isinstance(v, str) else v,
+    "json": lambda v: json.dumps(v) if not isinstance(v, str) else v,
+}
 
 
-# ============================================================================
-# CUSTOM FASTMCP MIDDLEWARE: Circuit Breaker
-# ============================================================================
-
-class CircuitBreakerMiddleware(Middleware):
-    """
-    FastMCP-native circuit breaker middleware.
-
-    Intercepts tool calls at the MCP protocol level (on_call_tool hook).
-    If the circuit is OPEN, rejects immediately with a structured error.
-    Records success/failure after the tool executes.
-
-    Uses the FastMCP middleware API (v2.9+) — works across all transports,
-    not just HTTP.
-    """
-
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        tool_name = context.message.name
-
-        # Local diagnostic tools bypass the circuit — they don't hit Cloud Run
-        if tool_name in ("ping", "horizon_status"):
-            return await call_next(context)
-
-        if not circuit.can_execute():
-            from mcp import McpError
-            from mcp.types import ErrorData
-            raise McpError(
-                ErrorData(
-                    code=-32000,
-                    message=(
-                        f"Circuit breaker OPEN — Cloud Run backend is down. "
-                        f"Will retry automatically in {int(CB_RECOVERY_TIMEOUT)}s. "
-                        f"State: {json.dumps(circuit.status())}"
-                    ),
-                )
-            )
-
-        try:
-            result = await call_next(context)
-            circuit.record_success()
-            return result
-        except Exception as exc:
-            error_str = str(exc)
-            # Only trip the circuit on infrastructure failures, not tool-level errors
-            if any(s in error_str for s in [
-                "Cloud Run returned 5",
-                "did not respond within",
-                "Cannot reach Cloud Run",
-                "connection_failed",
-            ]):
-                circuit.record_failure()
-            raise
-
-
-# ============================================================================
-# BACKEND HEALTH MONITOR
-# ============================================================================
-
-class BackendHealth:
-    """Tracks Cloud Run health via periodic background checks."""
-
-    def __init__(self):
-        self.healthy = True
-        self.last_check_time = 0.0
-        self.last_check_result: Optional[dict] = None
-        self.tool_count = 0
-        self.consecutive_failures = 0
-
-    async def check(self) -> bool:
-        try:
-            async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT) as client:
-                resp = await client.get(
-                    f"{CLOUD_RUN_URL}/health",
-                    headers={"X-API-Key": API_KEY},
-                )
-            if resp.status_code == 200:
-                data = resp.json()
-                self.healthy = data.get("status") == "ok"
-                self.tool_count = data.get("tool_count", 0)
-                self.last_check_result = data
-                self.consecutive_failures = 0
-            else:
-                self.healthy = False
-                self.consecutive_failures += 1
-                self.last_check_result = {"http_code": resp.status_code}
-        except Exception as exc:
-            self.healthy = False
-            self.consecutive_failures += 1
-            self.last_check_result = {"error": str(exc)[:200]}
-
-        self.last_check_time = time.monotonic()
-        return self.healthy
-
-    def status(self) -> dict:
-        return {
-            "healthy": self.healthy,
-            "tool_count": self.tool_count,
-            "consecutive_failures": self.consecutive_failures,
-            "seconds_since_check": (
-                round(time.monotonic() - self.last_check_time, 1)
-                if self.last_check_time > 0 else None
-            ),
-            "last_result": self.last_check_result,
-        }
-
-
-backend = BackendHealth()
-
-_health_task: Optional[asyncio.Task] = None
-
-
-async def _health_loop():
-    """Periodically check Cloud Run health and update circuit breaker."""
-    while True:
-        try:
-            healthy = await backend.check()
-            if healthy and circuit.state in ("OPEN", "HALF_OPEN"):
-                circuit.record_success()
-        except Exception:
-            pass
-        await asyncio.sleep(CB_HEALTH_INTERVAL)
-
-
-def _ensure_health_loop():
-    """Start the background health loop if not running."""
-    global _health_task
-    if _health_task is None or _health_task.done():
-        _health_task = asyncio.create_task(_health_loop())
-
-
-# ============================================================================
-# CORE: Forward to Cloud Run /execute
-# ============================================================================
-
-async def _forward_to_cloud_run(tool_name: str, arguments: dict) -> Any:
-    """
-    POST to Cloud Run /execute with resilience.
-    One retry on 503 (cold start). 30s timeout.
-    """
-    payload = {"tool_name": tool_name, "arguments": arguments}
-    headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
-
-    async with httpx.AsyncClient(timeout=EXECUTE_TIMEOUT) as client:
-        resp = await client.post(
-            f"{CLOUD_RUN_URL}/execute", json=payload, headers=headers,
-        )
-
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("status") == "ok":
-            return data.get("result", data)
-        return data
-
-    # Retry once on 503 (cold start / scaling)
-    if resp.status_code == 503:
-        await asyncio.sleep(RETRY_DELAY)
-        async with httpx.AsyncClient(timeout=EXECUTE_TIMEOUT) as client:
-            resp2 = await client.post(
-                f"{CLOUD_RUN_URL}/execute", json=payload, headers=headers,
-            )
-        if resp2.status_code == 200:
-            data = resp2.json()
-            if data.get("status") == "ok":
-                return data.get("result", data)
-            return data
-        raise RuntimeError(
-            f"Cloud Run returned {resp2.status_code} after retry"
-        )
-
-    # Non-transient failure
+def _iq_heuristic(k: str, v):
+    if v in _IQ_NULL:
+        return None
     try:
-        body = resp.json()
-    except Exception:
-        body = resp.text[:500]
+        if _IQ_INT_PAT.search(k.lower()):
+            return int(v)
+        if _IQ_FLOAT_PAT.search(k.lower()):
+            return float(v)
+        if _IQ_BOOL_PAT.match(k.lower()) and isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+    except (ValueError, TypeError):
+        pass
+    return v
 
-    return {
-        "status": "error",
-        "error": f"Cloud Run returned {resp.status_code}",
-        "http_code": resp.status_code,
-        "body": json.dumps(body) if isinstance(body, dict) else str(body),
+
+def coerce_args(args: dict, schema=None) -> dict:
+    """Two-pass coercion: schema types first, heuristics second."""
+    if not isinstance(args, dict):
+        return args
+    props = {}
+    if schema:
+        raw = schema if isinstance(schema, dict) else json.loads(schema)
+        props = raw.get("properties", {})
+    out = {}
+    for k, v in args.items():
+        if k in props:
+            fn = _IQ_SCHEMA_FN.get(props[k].get("type"))
+            if fn:
+                try:
+                    out[k] = fn(v)
+                    continue
+                except (ValueError, TypeError):
+                    pass
+        out[k] = _iq_heuristic(k, v)
+    return out
+
+
+def coerce_sql_vals(sql: str, vals) -> list:
+    """Read $N::type SQL casts, coerce Python vals to match asyncpg."""
+    out = list(vals)
+    for m in _IQ_CAST_RE.finditer(sql):
+        pos = int(m.group(1)) - 1
+        cast = m.group(2).lower()
+        if 0 <= pos < len(out) and cast in _IQ_CAST_FN:
+            try:
+                out[pos] = _IQ_CAST_FN[cast](out[pos])
+            except Exception:
+                pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# DB helpers (match miller-mcp-db exactly)
+# ---------------------------------------------------------------------------
+async def db_execute(conn, sql, *vals):
+    return await conn.execute(sql, *coerce_sql_vals(sql, vals))
+
+
+async def db_fetch(conn, sql, *vals):
+    return await conn.fetch(sql, *coerce_sql_vals(sql, vals))
+
+
+async def db_fetchrow(conn, sql, *vals):
+    return await conn.fetchrow(sql, *coerce_sql_vals(sql, vals))
+
+
+async def db_fetchval(conn, sql, *vals):
+    return await conn.fetchval(sql, *coerce_sql_vals(sql, vals))
+
+
+async def db_executemany(conn, sql, many):
+    return await conn.executemany(sql, [coerce_sql_vals(sql, v) for v in many])
+
+
+# ---------------------------------------------------------------------------
+# Tool globals (injected into every exec() scope)
+# ---------------------------------------------------------------------------
+_TOOL_GLOBALS: Dict[str, Any] = {
+    "asyncio": asyncio,
+    "httpx": httpx,
+    "json": json,
+    "os": os,
+    "logger": logger,
+    "coerce_args": coerce_args,
+    "coerce_sql_vals": coerce_sql_vals,
+    "db_execute": db_execute,
+    "db_fetch": db_fetch,
+    "db_fetchrow": db_fetchrow,
+    "db_fetchval": db_fetchval,
+    "db_executemany": db_executemany,
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch (direct DB executor — no proxy hop)
+# ---------------------------------------------------------------------------
+async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
+    """
+    Load tool code from DB, compile and run it.
+    Every call reads fresh from tool_registry — no in-memory cache.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT code, input_schema FROM tool_registry "
+            "WHERE name = $1 AND enabled = TRUE",
+            tool_name,
+        )
+    if row is None:
+        async with db_pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE"
+            )
+        raise ValueError(
+            f"Tool '{tool_name}' not found in the registry "
+            f"({count} tools loaded). Check the tool name and try again."
+        )
+
+    code = row["code"]
+    schema = row["input_schema"]
+    arguments = coerce_args(arguments, schema)
+
+    scope: Dict[str, Any] = {
+        **_TOOL_GLOBALS,
+        "db_pool": db_pool,
+        "_dispatch": _dispatch,
+        "args": arguments,
     }
 
+    try:
+        exec(compile(code, f"<tool:{tool_name}>", "exec"), scope)
+    except SyntaxError as exc:
+        raise RuntimeError(f"Tool '{tool_name}' has a syntax error: {exc}") from exc
 
-# ============================================================================
-# MCP SERVER — with FastMCP native middleware stack
-# ============================================================================
+    run_fn = scope.get("run")
+    if run_fn is None:
+        raise RuntimeError(
+            f"Tool '{tool_name}' must define `async def run(args: dict) -> ...:`"
+        )
 
-mcp = FastMCP("MillerMCPDB")
-
-# Middleware stack (execution order: first added = outermost)
-# 1. Error handling — outermost, catches everything
-mcp.add_middleware(ErrorHandlingMiddleware())
-# 2. Rate limiting — reject floods before they hit the backend
-mcp.add_middleware(RateLimitingMiddleware(max_requests_per_second=10))
-# 3. Timing — measure every operation
-mcp.add_middleware(TimingMiddleware())
-# 4. Logging — structured logs for all MCP traffic
-mcp.add_middleware(LoggingMiddleware())
-# 5. Circuit breaker — custom, protects Cloud Run from cascading failures
-mcp.add_middleware(CircuitBreakerMiddleware())
+    if inspect.iscoroutinefunction(run_fn):
+        return await run_fn(arguments)
+    else:
+        return run_fn(arguments)
 
 
-# ============================================================================
-# TOOLS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# JSON-RPC helpers
+# ---------------------------------------------------------------------------
+SERVER_INFO = {
+    "name": "miller-mcp-gateway",
+    "version": "1.0.0",
+}
 
-@mcp.tool()
-async def meta_tool(tool_name: str, arguments: Any = None) -> Any:
-    """
-    Execute any tool stored in the Postgres tool registry by name.
-
-    This is the single entry point for all custom tools. When a user asks
-    you to use a specific tool (e.g. "use the save_memory tool" or "send a
-    prompt to the Gemini agent"), call this with the tool's name and any
-    required arguments.
-
-    Args:
-        tool_name:  Name of the tool to run, exactly as stored in Postgres.
-        arguments:  Key/value pairs the tool needs (omit or pass null if none required).
-
-    Returns the tool's result directly.
-    """
-    _ensure_health_loop()
-    args = arguments if isinstance(arguments, dict) else (arguments or {})
-    return await _forward_to_cloud_run(tool_name, args)
+PROTOCOL_VERSION = "2025-03-26"
 
 
-@mcp.tool()
-def ping() -> str:
-    """Returns pong to verify Horizon MCP connectivity. Does not touch Cloud Run."""
-    return "pong — Miller IQ Platform is alive"
+def _jsonrpc_ok(id, result):
+    return {"jsonrpc": "2.0", "id": id, "result": result}
 
 
-@mcp.tool()
-def horizon_status() -> dict:
-    """
-    Returns the current health of the Horizon gateway.
-    Shows circuit breaker state, backend health, and config.
-    Does not touch Cloud Run — pure Horizon diagnostics.
-    """
-    return {
-        "gateway": "Horizon MCP Gateway v2 — Enterprise",
-        "circuit": circuit.status(),
-        "backend": backend.status(),
-        "middleware": [
-            "ErrorHandlingMiddleware (FastMCP native)",
-            "RateLimitingMiddleware (FastMCP native, 10 req/s)",
-            "TimingMiddleware (FastMCP native)",
-            "LoggingMiddleware (FastMCP native)",
-            "CircuitBreakerMiddleware (custom, threshold=3, recovery=30s)",
-        ],
-        "config": {
-            "cloud_run_url": CLOUD_RUN_URL,
-            "execute_timeout_seconds": EXECUTE_TIMEOUT,
-            "health_check_interval_seconds": CB_HEALTH_INTERVAL,
-            "circuit_failure_threshold": CB_FAILURE_THRESHOLD,
-            "circuit_recovery_timeout_seconds": CB_RECOVERY_TIMEOUT,
+def _jsonrpc_error(id, code, message, data=None):
+    err = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": id, "error": err}
+
+
+# ---------------------------------------------------------------------------
+# MCP method handlers
+# ---------------------------------------------------------------------------
+async def _handle_initialize(params: dict, req_id):
+    """MCP initialize handshake."""
+    return _jsonrpc_ok(req_id, {
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {
+            "tools": {"listChanged": False},
         },
+        "serverInfo": SERVER_INFO,
+    })
+
+
+async def _handle_tools_list(params: dict, req_id):
+    """Return all enabled tools from tool_registry."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT name, description, input_schema "
+            "FROM tool_registry WHERE enabled = TRUE "
+            "ORDER BY name"
+        )
+    tools = []
+    for r in rows:
+        schema = r["input_schema"]
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except json.JSONDecodeError:
+                schema = {}
+        tools.append({
+            "name": r["name"],
+            "description": r["description"] or "",
+            "inputSchema": schema if schema else {"type": "object", "properties": {}},
+        })
+    return _jsonrpc_ok(req_id, {"tools": tools})
+
+
+async def _handle_tools_call(params: dict, req_id):
+    """Execute a tool via _dispatch."""
+    tool_name = params.get("name", "")
+    arguments = params.get("arguments", {}) or {}
+
+    try:
+        result = await _dispatch(tool_name, arguments)
+        # Normalize result to string
+        if isinstance(result, dict) or isinstance(result, list):
+            text = json.dumps(result, default=str)
+        elif result is None:
+            text = json.dumps({"status": "ok"})
+        else:
+            text = str(result)
+        return _jsonrpc_ok(req_id, {
+            "content": [{"type": "text", "text": text}],
+        })
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error("Tool %s failed: %s\n%s", tool_name, exc, tb)
+        return _jsonrpc_ok(req_id, {
+            "content": [{"type": "text", "text": json.dumps({
+                "error": str(exc),
+                "tool": tool_name,
+            })}],
+            "isError": True,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Route: POST /mcp — Streamable HTTP (MCP 2025-03-26)
+# ---------------------------------------------------------------------------
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    """
+    Single MCP endpoint — Streamable HTTP transport.
+    Receives JSON-RPC, returns application/json.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content=_jsonrpc_error(None, -32700, "Parse error"),
+        )
+
+    # Handle batch requests
+    if isinstance(body, list):
+        results = []
+        for item in body:
+            r = await _handle_single(item)
+            if r is not None:  # notifications return None
+                results.append(r)
+        if not results:
+            return Response(status_code=202)
+        return JSONResponse(content=results)
+
+    # Single request/notification
+    result = await _handle_single(body)
+    if result is None:
+        return Response(status_code=202)
+    return JSONResponse(content=result)
+
+
+async def _handle_single(msg: dict):
+    """Route a single JSON-RPC message to the right handler."""
+    method = msg.get("method", "")
+    req_id = msg.get("id")  # None for notifications
+    params = msg.get("params", {}) or {}
+
+    # Notifications (no id) — acknowledge silently
+    if req_id is None:
+        # notifications/initialized, notifications/cancelled, etc.
+        return None
+
+    handlers = {
+        "initialize": _handle_initialize,
+        "tools/list": _handle_tools_list,
+        "tools/call": _handle_tools_call,
+        "ping": lambda p, i: _jsonrpc_ok(i, {}),
     }
+
+    handler = handlers.get(method)
+    if handler is None:
+        return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
+
+    try:
+        if asyncio.iscoroutinefunction(handler):
+            return await handler(params, req_id)
+        return handler(params, req_id)
+    except Exception as exc:
+        logger.error("Handler %s error: %s", method, exc, exc_info=True)
+        return _jsonrpc_error(req_id, -32603, f"Internal error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Route: GET /mcp — optional SSE stream (return 405 for now)
+# ---------------------------------------------------------------------------
+@app.get("/mcp")
+async def mcp_get():
+    """We don't need server-initiated messages. Return 405."""
+    return Response(status_code=405)
+
+
+# ---------------------------------------------------------------------------
+# Route: DELETE /mcp — session termination (not needed)
+# ---------------------------------------------------------------------------
+@app.delete("/mcp")
+async def mcp_delete():
+    return Response(status_code=405)
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    try:
+        async with db_pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE"
+            )
+        return {"status": "healthy", "tools_loaded": count}
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(exc)},
+        )
