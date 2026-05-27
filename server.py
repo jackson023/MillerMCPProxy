@@ -444,6 +444,48 @@ async def mcp_delete():
 
 
 # ---------------------------------------------------------------------------
+# Route: POST /execute — plain HTTP executor for AlloyDB predict_row()
+# ---------------------------------------------------------------------------
+@app.post("/execute")
+async def execute(request: Request):
+    """
+    Simple HTTP executor. AlloyDB's google_ml.predict_row() calls this.
+    Expects: {"tool_name": "...", "arguments": {...}}
+    Returns: JSON result from the tool.
+    """
+    # API key check
+    api_key = request.headers.get("x-api-key", "")
+    if api_key != os.environ.get("API_KEY", "miller-techstack-2026"):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+
+    tool_name = body.get("tool_name", "")
+    arguments = body.get("arguments", {}) or {}
+
+    if not tool_name:
+        return JSONResponse(status_code=400, content={"error": "tool_name required"})
+
+    try:
+        result = await _dispatch(tool_name, arguments)
+        if isinstance(result, (dict, list)):
+            return JSONResponse(content=result)
+        elif result is None:
+            return JSONResponse(content={"status": "ok"})
+        else:
+            return JSONResponse(content={"result": str(result)})
+    except Exception as exc:
+        logger.error("Execute %s failed: %s", tool_name, exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(exc), "tool": tool_name},
+        )
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 @app.get("/health")
