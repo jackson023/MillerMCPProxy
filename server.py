@@ -19,10 +19,18 @@ Design principle: Horizon is infrastructure. Zero business logic.
 """
 
 import asyncio
+import base64
+import datetime
+import hashlib
 import json
+import logging
+import os
+import re
 import time
+import uuid
 from typing import Any, Dict, Optional
 
+import asyncpg
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -30,6 +38,8 @@ from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
 from fastmcp.server.middleware.rate_limiting import RateLimitingMiddleware
 from fastmcp.server.middleware.timing import TimingMiddleware
 from fastmcp.server.middleware.logging import LoggingMiddleware
+
+logger = logging.getLogger("miller-gateway")
 
 
 # ============================================================================
@@ -110,6 +120,62 @@ circuit = CircuitState(
     failure_threshold=CB_FAILURE_THRESHOLD,
     recovery_timeout=CB_RECOVERY_TIMEOUT,
 )
+
+# ============================================================================
+# DIRECT DB EXECUTION
+# ============================================================================
+
+db_pool: Optional[asyncpg.Pool] = None
+
+
+async def _init_db_pool():
+    global db_pool
+    dsn = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://')
+    db_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+    logger.info("DB pool created")
+
+
+async def _close_db_pool():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        logger.info("DB pool closed")
+
+
+async def _execute_tool_direct(tool_name: str, arguments: dict) -> Any:
+    """Execute tool directly from tool_registry via DB."""
+    if db_pool is None:
+        raise RuntimeError("DB pool not initialized")
+
+    code = await db_pool.fetchval(
+        "SELECT code FROM tool_registry WHERE name=$1 AND enabled=TRUE",
+        tool_name
+    )
+    if not code:
+        return {"status": "error", "error": f"Tool '{tool_name}' not found or disabled"}
+
+    namespace = {
+        'db_pool': db_pool,
+        'logger': logger,
+        'httpx': httpx,
+        'asyncpg': asyncpg,
+        'json': json,
+        'os': os,
+        'datetime': datetime,
+        're': re,
+        'uuid': uuid,
+        'time': time,
+        'base64': base64,
+        'hashlib': hashlib,
+        'asyncio': asyncio,
+    }
+    exec(code, namespace)
+
+    if 'run' not in namespace:
+        return {"status": "error", "error": f"Tool '{tool_name}' has no run() function"}
+
+    result = await asyncio.wait_for(namespace['run'](arguments), timeout=55)
+    return result
 
 
 # ============================================================================
@@ -336,6 +402,18 @@ async def meta_tool(tool_name: str, arguments: Any = None) -> Any:
     """
     _ensure_health_loop()
     args = arguments if isinstance(arguments, dict) else (arguments or {})
+
+    # Try direct DB execution first
+    if db_pool is not None:
+        try:
+            return await _execute_tool_direct(tool_name, args)
+        except asyncio.TimeoutError:
+            return {"status": "error", "error": f"Tool '{tool_name}' timed out after 55s"}
+        except Exception as exc:
+            logger.error(f"Direct exec failed for {tool_name}: {exc}")
+            # Fall through to HTTP fallback
+
+    # HTTP fallback (original path)
     return await _forward_to_cloud_run(tool_name, args)
 
 
@@ -371,3 +449,20 @@ def horizon_status() -> dict:
             "circuit_recovery_timeout_seconds": CB_RECOVERY_TIMEOUT,
         },
     }
+
+
+if __name__ == "__main__":
+    import asyncio as _aio
+
+    async def _main():
+        await _init_db_pool()
+        try:
+            await mcp.run_async(
+                transport="streamable-http",
+                host="0.0.0.0",
+                port=int(os.environ.get("PORT", 8080)),
+            )
+        finally:
+            await _close_db_pool()
+
+    _aio.run(_main())
