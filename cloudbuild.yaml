@@ -1,0 +1,73 @@
+# Miller MCP Gateway — Docker image build + deploy
+# Trigger: GitHub push to jackson023/MillerMCPProxy (main branch)
+# Config matches platform_service_registry row for miller-mcp-gateway exactly.
+
+steps:
+  # Build Docker image tagged with commit SHA
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/miller-iq/miller-mcp-gateway:$COMMIT_SHA'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/miller-iq/miller-mcp-gateway:latest'
+      - '.'
+
+  # Push to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/miller-iq/miller-mcp-gateway'
+
+  # Deploy to Cloud Run (config from platform_service_registry)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'miller-mcp-gateway'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/miller-iq/miller-mcp-gateway:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--min-instances=1'
+      - '--max-instances=10'
+      - '--timeout=300'
+      - '--port=8080'
+      - '--service-account=146372550543-compute@developer.gserviceaccount.com'
+      - '--set-secrets=DATABASE_URL=miller-mcp-gateway-database-url:latest,GITHUB_PAT=miller-mcp-github-pat:latest,ANTHROPIC_API_KEY=miller-iq-global-anthropic-api-key:latest,GEMINI_API_KEY=miller-iq-global-gemini-api-key:latest,SLACK_BOT_TOKEN=miller-iq-slack-bot-token:latest,GMAIL_CLIENT_ID=miller-gmail-client-id:latest,GMAIL_CLIENT_SECRET=miller-gmail-client-secret:latest,GMAIL_REFRESH_TOKEN=miller-gmail-refresh-token:latest'
+      - '--network=default'
+      - '--vpc-egress=private-ranges-only'
+      - '--add-cloudsql-instances=miller-iq-platform:us-central1:miller-iq-alloydb'
+      - '--no-invoker-iam-check'
+
+  # Enforce public access — prevents IAM auth drift permanently
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'services'
+      - 'add-iam-policy-binding'
+      - 'miller-mcp-gateway'
+      - '--region=us-central1'
+      - '--member=allUsers'
+      - '--role=roles/run.invoker'
+      - '--quiet'
+
+  # Post-deploy: sync registry with new image + revision
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        curl -sf -X POST https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute \
+          -H "Content-Type: application/json" \
+          -H "X-API-Key: miller-techstack-2026" \
+          -d '{"tool_name":"sync_service_registry","arguments":{"service_name":"miller-mcp-gateway"}}' \
+          && echo "Registry synced"
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/miller-iq/miller-mcp-gateway'
+
+timeout: '900s'
