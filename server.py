@@ -308,37 +308,61 @@ async def _handle_initialize(params: dict, req_id):
 
 
 async def _handle_tools_list(params: dict, req_id):
-    """Return all enabled tools from tool_registry."""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT name, description, input_schema "
-            "FROM tool_registry WHERE enabled = TRUE "
-            "ORDER BY name"
-        )
-    tools = []
-    for r in rows:
-        schema = r["input_schema"]
-        if isinstance(schema, str):
-            try:
-                schema = json.loads(schema)
-            except json.JSONDecodeError:
-                schema = {}
-        tools.append({
-            "name": r["name"],
-            "description": r["description"] or "",
-            "inputSchema": schema if schema else {"type": "object", "properties": {}},
-        })
+    """Return ONLY meta_tool — the single gateway entry point.
+
+    Claude Chat sees one tool. All 1,200+ platform tools are called
+    through meta_tool(tool_name="...", arguments={...}).
+    """
+    tools = [{
+        "name": "meta_tool",
+        "description": (
+            "Miller IQ Platform gateway. Call any of 1,200+ tools by name. "
+            "Arguments: tool_name (string, required) — the tool to execute; "
+            "arguments (object, optional) — the tool's input arguments."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the tool to execute"
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Arguments to pass to the tool",
+                    "default": {}
+                }
+            },
+            "required": ["tool_name"]
+        }
+    }]
     return _jsonrpc_ok(req_id, {"tools": tools})
 
 
 async def _handle_tools_call(params: dict, req_id):
-    """Execute a tool via _dispatch."""
-    tool_name = params.get("name", "")
+    """Execute a tool via _dispatch — intercepts meta_tool for direct routing."""
+    call_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
 
+    # meta_tool fast path: extract inner tool_name and dispatch directly
+    # No DB round-trip for meta_tool itself — just unwrap and forward.
+    if call_name == "meta_tool":
+        tool_name = arguments.get("tool_name", "")
+        tool_args = arguments.get("arguments", {}) or {}
+        if not tool_name:
+            return _jsonrpc_ok(req_id, {
+                "content": [{"type": "text", "text": json.dumps({
+                    "error": "tool_name is required in meta_tool arguments"
+                })}],
+                "isError": True,
+            })
+    else:
+        # Direct tool call (backward compat — /execute still works)
+        tool_name = call_name
+        tool_args = arguments
+
     try:
-        result = await _dispatch(tool_name, arguments)
-        # Normalize result to string
+        result = await _dispatch(tool_name, tool_args)
         if isinstance(result, dict) or isinstance(result, list):
             text = json.dumps(result, default=str)
         elif result is None:
