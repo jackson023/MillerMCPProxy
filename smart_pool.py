@@ -349,6 +349,33 @@ class SmartPool:
         except Exception as e:
             logger.warning('SmartPool: GCS flag delete failed (non-blocking): %s', e)
 
+        # Auto-fire bq_replay for all DR tables via Inngest (non-blocking)
+        try:
+            async with self._alloydb.acquire() as conn:
+                key_raw = await conn.fetchval(
+                    "SELECT value FROM platform_settings WHERE key = 'INNGEST_EVENT_KEY'"
+                )
+            if key_raw:
+                event_key = json.loads(key_raw) if isinstance(key_raw, str) else str(key_raw)
+                payload = json.dumps({
+                    'name': 'platform/tool.run',
+                    'data': {
+                        'tool_name': 'bq_replay',
+                        'args': {'all_tables': True, 'triggered_by': 'exit_degraded'}
+                    }
+                }).encode()
+                async with httpx.AsyncClient(timeout=10) as c:
+                    r = await c.post(
+                        f'https://inn.gs/e/{event_key}',
+                        content=payload,
+                        headers={'Content-Type': 'application/json'}
+                    )
+                logger.info('SmartPool: bq_replay auto-fired via Inngest (status=%s)', r.status_code)
+            else:
+                logger.warning('SmartPool: INNGEST_EVENT_KEY not found — bq_replay not auto-fired')
+        except Exception as e:
+            logger.error('SmartPool: bq_replay auto-fire failed (non-blocking): %s', e)
+
     async def check_degraded_flag(self):
         """Called on startup — if GCS flag exists, enter degraded mode immediately."""
         try:
