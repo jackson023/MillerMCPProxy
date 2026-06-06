@@ -34,9 +34,6 @@ steps:
   waitFor: [push]
 images: ["$_IMAGE:$COMMIT_SHA", "$_IMAGE:latest"]
 options:
-  logging: GCS_ONLY
   dynamicSubstitutions: true
   automapSubstitutions: true
-  pool:
-    name: projects/miller-iq-platform/locations/us-central1/workerPools/miller-iq-private-pool
 timeout: 1200s
