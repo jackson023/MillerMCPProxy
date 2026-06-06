@@ -102,6 +102,14 @@ def _resolve_val(expr, args):
     if isinstance(expr, sqlglot.exp.Literal): return int(expr.name) if expr.is_number else expr.name
     if isinstance(expr, sqlglot.exp.Boolean): return expr.args.get('this', False)
     if isinstance(expr, sqlglot.exp.Null): return None
+    # Substitute SQL timestamp functions with real current timestamp (bug #3970)
+    # BQ insertAll does not evaluate SQL functions — needs literal ISO string
+    if isinstance(expr, (sqlglot.exp.CurrentTimestamp, sqlglot.exp.CurrentDatetime,
+                          sqlglot.exp.CurrentDate)):
+        return datetime.now(timezone.utc).isoformat()
+    if isinstance(expr, sqlglot.exp.Anonymous) and expr.name.upper() in (
+            'NOW', 'CURRENT_TIMESTAMP', 'CURRENT_TIME'):
+        return datetime.now(timezone.utc).isoformat()
     return expr.sql()
 
 def _parse_write(pg_sql: str, args: tuple) -> dict:
