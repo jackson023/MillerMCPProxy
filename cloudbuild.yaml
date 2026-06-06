@@ -27,9 +27,7 @@ steps:
   - -c
   - |
     set -euo pipefail
-    sed -e "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g" \\
-        -e "s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g" \\
-        service.yaml > /tmp/svc.yaml
+    sed -e "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g" -e "s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g" service.yaml > /tmp/svc.yaml
     gcloud run services replace /tmp/svc.yaml --region=$_REGION --project=$_PROJECT
   waitFor: [push]
 images: ["$_IMAGE:$COMMIT_SHA", "$_IMAGE:latest"]
