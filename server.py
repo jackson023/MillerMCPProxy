@@ -534,6 +534,36 @@ async def api_alloydb_recovered(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Cloud Build Pub/Sub webhook routes
+# ---------------------------------------------------------------------------
+@app.post("/webhooks/cloudbuild")
+async def webhook_cloudbuild(request: Request):
+    """Pub/Sub push: ALL Cloud Build status events -> handle_cloudbuild_webhook."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "ack", "detail": "unparseable"}, 200)
+    # Return 200 immediately -- Pub/Sub requires ack within deadline.
+    # handle_cloudbuild_webhook writes build_events and fires Inngest on terminal.
+    asyncio.create_task(_dispatch("handle_cloudbuild_webhook", {"body": body}))
+    return JSONResponse({"status": "ack"}, 200)
+
+
+@app.post("/webhooks/build-complete")
+async def webhook_build_complete(request: Request):
+    """Pub/Sub push: SUCCESS-only Cloud Build events (finalize gate)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "ack", "detail": "unparseable"}, 200)
+    # finalize_only=True: skips duplicate build_events row (already written
+    # by /webhooks/cloudbuild which receives all events including SUCCESS).
+    asyncio.create_task(
+        _dispatch("handle_cloudbuild_webhook", {"body": body, "finalize_only": True})
+    )
+    return JSONResponse({"status": "ack"}, 200)
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 @app.get("/health")
