@@ -21,6 +21,7 @@ import asyncpg
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from smart_pool import SmartPool, BigQueryPool
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -36,7 +37,7 @@ app = FastAPI(title="Miller MCP Gateway", docs_url=None, redoc_url=None)
 # ---------------------------------------------------------------------------
 # Database pool (AlloyDB direct)
 # ---------------------------------------------------------------------------
-db_pool: asyncpg.Pool | None = None
+db_pool: SmartPool | None = None
 
 
 @app.on_event("startup")
@@ -46,8 +47,10 @@ async def _startup():
     # asyncpg needs postgresql:// not postgresql+asyncpg://
     if "+asyncpg" in dsn:
         dsn = dsn.replace("postgresql+asyncpg", "postgresql")
-    db_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=120)
-    logger.info("DB pool ready — connected to AlloyDB")
+    _alloydb_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=120)
+    db_pool = SmartPool(_alloydb_pool, BigQueryPool())
+    await db_pool.check_degraded_flag()
+    logger.info("SmartPool ready — AlloyDB direct, BQ fallback armed")
 
 
 @app.on_event("shutdown")
@@ -507,6 +510,27 @@ async def execute(request: Request):
             status_code=500,
             content={"error": str(exc), "tool": tool_name},
         )
+
+
+# ---------------------------------------------------------------------------
+# Route: POST /api/tool-reload
+# ---------------------------------------------------------------------------
+@app.post("/api/tool-reload")
+async def api_tool_reload(request: Request):
+    logger.info("tool-reload signal received")
+    return JSONResponse({"status": "ok", "message": "tools always fresh from DB"})
+
+
+# ---------------------------------------------------------------------------
+# Route: POST /api/alloydb-recovered
+# ---------------------------------------------------------------------------
+@app.post("/api/alloydb-recovered")
+async def api_alloydb_recovered(request: Request):
+    if db_pool and hasattr(db_pool, '_exit_degraded'):
+        await db_pool._exit_degraded()
+        logger.info("SmartPool: exiting degraded mode")
+        return JSONResponse({"status": "ok", "degraded": False, "action": "bq_replay_pending"})
+    return JSONResponse({"status": "ok", "degraded": False, "message": "already in normal mode"})
 
 
 # ---------------------------------------------------------------------------

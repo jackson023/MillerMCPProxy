@@ -1,0 +1,102 @@
+# service.yaml — Cloud Run multi-container spec for miller-mcp-db-v3
+# AlloyDB Auth Proxy sidecar at localhost:5432
+# Cluster/Instance injected at build time via ALLOYDB_INSTANCE_PLACEHOLDER → cloudbuild.yaml _ALLOYDB_INSTANCE_URI
+#
+# All sensitive values via Secret Manager secretKeyRef — zero plain-text secrets.
+# IMAGE_PLACEHOLDER is replaced at build time by cloudbuild.yaml deploy step.
+#
+# Manual deploy:
+#   sed 's|IMAGE_PLACEHOLDER|<your-image-tag>|' service.yaml > /tmp/svc.yaml
+#   gcloud run services replace /tmp/svc.yaml --region=us-central1 --project=miller-iq-platform
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: miller-mcp-db-v3
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/maxScale: '13'
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '10'
+        autoscaling.knative.dev/minScale: '1'
+        run.googleapis.com/container-dependencies: '{"app":["alloydb-proxy"]}'
+        run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+        run.googleapis.com/startup-cpu-boost: 'true'
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+      labels:
+        run.googleapis.com/startupProbeType: Default
+    spec:
+      containerConcurrency: 80
+      containers:
+      - name: app
+        image: IMAGE_PLACEHOLDER
+        ports:
+        - containerPort: 8080
+          name: http1
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        env:
+        - name: TOOL_RELOAD_TS
+          value: '20260505-1520'
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-mcp-db-database-url
+        - name: GITHUB_PAT
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-mcp-github-pat
+        - name: BROWSERLESS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: browserless-api-key
+        - name: INNGEST_EVENT_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-inngest-event-key
+        - name: INNGEST_SIGNING_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-inngest-signing-key
+        startupProbe:
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 240
+          periodSeconds: 240
+          failureThreshold: 1
+      - name: alloydb-proxy
+        image: gcr.io/alloydb-connectors/alloydb-auth-proxy:latest
+        args:
+        - ALLOYDB_INSTANCE_PLACEHOLDER
+        - --port=5432
+        - --address=127.0.0.1
+        - --health-check
+        - --http-address=0.0.0.0
+        - --http-port=9090
+        resources:
+          limits:
+            cpu: '0.5'
+            memory: 128Mi
+        startupProbe:
+          httpGet:
+            path: /startup
+            port: 9090
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 1
+          failureThreshold: 3
+      serviceAccountName: 146372550543-compute@developer.gserviceaccount.com
+      timeoutSeconds: 300
+  traffic:
+  - latestRevision: true
+    percent: 100
