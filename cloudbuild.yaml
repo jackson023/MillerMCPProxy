@@ -36,4 +36,5 @@ images: ["$_IMAGE:$COMMIT_SHA", "$_IMAGE:latest"]
 options:
   dynamicSubstitutions: true
   automapSubstitutions: true
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
 timeout: 1200s
