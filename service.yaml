@@ -12,7 +12,7 @@
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: miller-mcp-db-v3
+  name: miller-mcp-gateway
   annotations:
     run.googleapis.com/ingress: all
     run.googleapis.com/maxScale: '13'
