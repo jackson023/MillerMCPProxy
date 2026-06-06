@@ -1,4 +1,4 @@
-# MillerMCPProxy — Cloud Build v1 — deploys miller-mcp-db-v3
+# MillerMCPProxy — Cloud Build v1 — deploys miller-mcp-gateway
 substitutions:
   _SERVICE: miller-mcp-db-v3
   _IMAGE: us-central1-docker.pkg.dev/miller-iq-platform/miller-iq/miller-mcp-db
