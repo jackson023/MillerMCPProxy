@@ -63,15 +63,24 @@ async def _shutdown():
 
 
 # ---------------------------------------------------------------------------
-# Execution graph — automatic call-chain tracking via ContextVar
+# Execution graph — automatic call-chain tracking
 #
-# _current_tool propagates through await chains automatically.  When tool A
-# awaits _dispatch('tool_b', ...), the second _dispatch call captures 'tool_a'
-# as the caller before overwriting the context with 'tool_b'.  The finally
-# block always restores the parent context, even on exceptions.
+# Three mechanisms capture tool→tool edges across every dispatch boundary:
 #
-# _record_call_edge runs fire-and-forget via asyncio.create_task so it never
-# adds latency to tool execution.  Failure is logged and swallowed.
+#   1. ContextVar (inline await _dispatch):
+#      _current_tool propagates through the await chain.  Every nested
+#      _dispatch call captures the parent before overwriting context.
+#
+#   2. Inngest threading (_triggered_by_tool in event args):
+#      When a tool fires an Inngest event it injects _triggered_by_tool
+#      (read from _caller_tool in scope).  _dispatch strips this key and
+#      uses it as the effective caller when ContextVar has no parent.
+#
+#   3. HTTP threading (X-Caller-Tool header on /execute):
+#      Any HTTP caller that sets X-Caller-Tool gets that name wired as the
+#      ContextVar before _dispatch runs, so the edge is recorded normally.
+#
+# _record_call_edge always runs fire-and-forget — never adds latency.
 # ---------------------------------------------------------------------------
 _current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_tool", default=None
@@ -286,21 +295,65 @@ async def db_executemany(conn, sql, many):
 
 
 # ---------------------------------------------------------------------------
+# _platform_call — HTTP tool-to-tool call with automatic caller threading
+#
+# Use this instead of raw httpx when a tool needs to call another tool via
+# the /execute endpoint.  Automatically injects X-Caller-Tool so the
+# receiving gateway can recover the caller context and record the edge.
+# ---------------------------------------------------------------------------
+_EXECUTE_URL = "https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute"
+_EXECUTE_KEY = os.environ.get("API_KEY", "miller-techstack-2026")
+
+
+async def _platform_call(
+    tool_name: str,
+    arguments: dict | None = None,
+    *,
+    timeout: float = 120.0,
+) -> dict:
+    """
+    Call another platform tool via /execute, threading caller context
+    automatically via the X-Caller-Tool header.
+
+    Usage inside any tool:
+        result = await _platform_call('some_tool', {'param': value})
+
+    The execution edge is recorded transparently on the receiving end.
+    """
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "X-API-Key":    _EXECUTE_KEY,
+    }
+    current = _current_tool.get()
+    if current:
+        headers["x-caller-tool"] = current
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            _EXECUTE_URL,
+            json={"tool_name": tool_name, "arguments": arguments or {}},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+# ---------------------------------------------------------------------------
 # Tool globals (injected into every exec() scope)
 # ---------------------------------------------------------------------------
 _TOOL_GLOBALS: Dict[str, Any] = {
-    "asyncio": asyncio,
-    "httpx": httpx,
-    "json": json,
-    "os": os,
-    "logger": logger,
-    "coerce_args": coerce_args,
-    "coerce_sql_vals": coerce_sql_vals,
-    "db_execute": db_execute,
-    "db_fetch": db_fetch,
-    "db_fetchrow": db_fetchrow,
-    "db_fetchval": db_fetchval,
+    "asyncio":        asyncio,
+    "httpx":          httpx,
+    "json":           json,
+    "os":             os,
+    "logger":         logger,
+    "coerce_args":    coerce_args,
+    "coerce_sql_vals":coerce_sql_vals,
+    "db_execute":     db_execute,
+    "db_fetch":       db_fetch,
+    "db_fetchrow":    db_fetchrow,
+    "db_fetchval":    db_fetchval,
     "db_executemany": db_executemany,
+    "_platform_call": _platform_call,  # HTTP tool-to-tool with caller threading
 }
 
 
@@ -312,16 +365,35 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
     Load tool code from DB, compile and run it.
     Every call reads fresh from tool_registry — no in-memory cache.
 
-    Execution graph tracking:
-      1. Capture caller = _current_tool.get() before overwriting context.
-      2. Set _current_tool to tool_name so any nested _dispatch calls see us
-         as their caller.
-      3. Reset in a finally block — guaranteed even on exception.
-      4. After reset, fire a non-blocking task to record the edge if a real
-         caller existed and neither side is in _EXEC_SKIP.
+    Execution graph tracking (three mechanisms):
+
+      Mechanism 1 — ContextVar (inline await _dispatch):
+        Captures caller = _current_tool.get() before overwriting context.
+        Restores in finally — always, even on exceptions.
+
+      Mechanism 2 — Inngest threading:
+        When caller is None and arguments contains _triggered_by_tool,
+        use that value as the effective caller and strip it from args.
+        fire_inngest_event injects this key using _caller_tool from scope.
+
+      Mechanism 3 — HTTP threading:
+        The /execute route sets the ContextVar from X-Caller-Tool before
+        calling _dispatch, so Mechanism 1 captures it transparently.
+
+      _caller_tool is injected into every tool's scope so tools can
+      read who called them (needed by fire_inngest_event for threading).
     """
     # Capture caller at the dispatch boundary, before we become the current tool
     caller: str | None = _current_tool.get()
+
+    # Mechanism 2: recover Inngest-threaded parent when ContextVar has no parent.
+    # Strip _triggered_by_tool before coerce_args so it never leaks into the tool.
+    if caller is None and isinstance(arguments, dict):
+        _inngest_parent = arguments.get("_triggered_by_tool")
+        if _inngest_parent and isinstance(_inngest_parent, str):
+            caller     = _inngest_parent
+            arguments  = {k: v for k, v in arguments.items()
+                          if k != "_triggered_by_tool"}
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -339,15 +411,16 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
             f"({count} tools loaded). Check the tool name and try again."
         )
 
-    code = row["code"]
+    code   = row["code"]
     schema = row["input_schema"]
     arguments = coerce_args(arguments, schema)
 
     scope: Dict[str, Any] = {
         **_TOOL_GLOBALS,
-        "db_pool": db_pool,
-        "_dispatch": _dispatch,
-        "args": arguments,
+        "db_pool":      db_pool,
+        "_dispatch":    _dispatch,
+        "_caller_tool": caller,    # Mechanism 2: fire_inngest_event reads this
+        "args":         arguments,
     }
 
     try:
@@ -376,7 +449,7 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
     # Conditions: real caller, not a self-call, neither side in skip list.
     if (
         caller is not None
-        and caller != tool_name
+        and caller    != tool_name
         and caller    not in _EXEC_SKIP
         and tool_name not in _EXEC_SKIP
     ):
@@ -590,6 +663,10 @@ async def execute(request: Request):
     Simple HTTP executor. AlloyDB's google_ml.predict_row() calls this.
     Expects: {"tool_name": "...", "arguments": {...}}
     Returns: JSON result from the tool.
+
+    Mechanism 3 — HTTP caller threading:
+    If the caller sets X-Caller-Tool header, we wire it as the ContextVar
+    before dispatching so the edge is captured by the normal ContextVar path.
     """
     # API key check
     api_key = request.headers.get("x-api-key", "")
@@ -607,6 +684,12 @@ async def execute(request: Request):
     if not tool_name:
         return JSONResponse(status_code=400, content={"error": "tool_name required"})
 
+    # Mechanism 3: thread HTTP caller into the ContextVar so _dispatch sees it.
+    # Strip empty strings — only set when a real caller name was provided.
+    _http_caller = request.headers.get("x-caller-tool", "").strip() or None
+    _http_token: contextvars.Token | None = (
+        _current_tool.set(_http_caller) if _http_caller else None
+    )
     try:
         result = await _dispatch(tool_name, arguments)
         if isinstance(result, (dict, list)):
@@ -621,6 +704,9 @@ async def execute(request: Request):
             status_code=500,
             content={"error": str(exc), "tool": tool_name},
         )
+    finally:
+        if _http_token is not None:
+            _current_tool.reset(_http_token)  # always restore, even on exception
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +759,7 @@ async def webhook_build_complete(request: Request):
         _dispatch("handle_cloudbuild_webhook", {"body": body, "finalize_only": True})
     )
     return JSONResponse({"status": "ack"}, 200)
+
 
 # ---------------------------------------------------------------------------
 # Health check
