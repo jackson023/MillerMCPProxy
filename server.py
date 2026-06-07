@@ -7,6 +7,7 @@ No FastMCP, no middleware, no proxy hop.
 """
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -59,6 +60,87 @@ async def _shutdown():
     if db_pool:
         await db_pool.close()
         logger.info("DB pool closed")
+
+
+# ---------------------------------------------------------------------------
+# Execution graph — automatic call-chain tracking via ContextVar
+#
+# _current_tool propagates through await chains automatically.  When tool A
+# awaits _dispatch('tool_b', ...), the second _dispatch call captures 'tool_a'
+# as the caller before overwriting the context with 'tool_b'.  The finally
+# block always restores the parent context, even on exceptions.
+#
+# _record_call_edge runs fire-and-forget via asyncio.create_task so it never
+# adds latency to tool execution.  Failure is logged and swallowed.
+# ---------------------------------------------------------------------------
+_current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_tool", default=None
+)
+
+# Tools excluded from execution edge recording.
+# Prevents recursive telemetry loops and noisy infrastructure calls.
+_EXEC_SKIP: frozenset[str] = frozenset({
+    "log_execution_edge",   # telemetry tool — would create self-referential edges
+    "open_session",         # session lifecycle — not a business call chain
+    "save_session",         # session lifecycle
+    "check_context_health", # observability — not part of business logic
+})
+
+
+async def _record_call_edge(caller: str, callee: str) -> None:
+    """
+    Record one execution edge caller → callee into:
+      - tool_call_log             (structured execution audit trail)
+      - platform_knowledge_links  (graph edge, edge_source='execution_graph')
+
+    Runs as a fire-and-forget asyncio.create_task().  Never raises — telemetry
+    must never interrupt tool execution.  Confidence compounds with repeated
+    observations up to a ceiling of 1.0 (+0.05 per confirmed call).
+    """
+    if not db_pool:
+        return  # pool not yet initialised (startup race guard)
+    try:
+        async with db_pool.acquire() as conn:
+            # Structured execution log
+            await conn.execute(
+                "INSERT INTO tool_call_log "
+                "(tool_name, caller_tool, status, called_at) "
+                "VALUES ($1, $2, 'ok', NOW())",
+                callee,
+                caller,
+            )
+            # Knowledge graph edge: upsert and compound confidence
+            await conn.execute(
+                """
+                INSERT INTO platform_knowledge_links
+                    (source_type, source_key, target_type, target_key,
+                     relationship, edge_source, confidence,
+                     occurrence_count, last_seen_at, payload)
+                VALUES
+                    ('tool', $1, 'tool', $2,
+                     'calls', 'execution_graph', 0.5,
+                     1, NOW(), '{}'::jsonb)
+                ON CONFLICT (source_type, source_key,
+                             target_type, target_key,
+                             relationship, edge_source)
+                WHERE source_key  IS NOT NULL
+                  AND target_key  IS NOT NULL
+                  AND edge_source IS NOT NULL
+                DO UPDATE SET
+                    occurrence_count = platform_knowledge_links.occurrence_count + 1,
+                    last_seen_at     = NOW(),
+                    confidence       = LEAST(
+                                           1.0,
+                                           platform_knowledge_links.confidence + 0.05
+                                       )
+                """,
+                caller,
+                callee,
+            )
+    except Exception as exc:
+        logger.warning(
+            "exec-graph: failed to record %s -> %s: %s", caller, callee, exc
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +311,18 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
     """
     Load tool code from DB, compile and run it.
     Every call reads fresh from tool_registry — no in-memory cache.
+
+    Execution graph tracking:
+      1. Capture caller = _current_tool.get() before overwriting context.
+      2. Set _current_tool to tool_name so any nested _dispatch calls see us
+         as their caller.
+      3. Reset in a finally block — guaranteed even on exception.
+      4. After reset, fire a non-blocking task to record the edge if a real
+         caller existed and neither side is in _EXEC_SKIP.
     """
+    # Capture caller at the dispatch boundary, before we become the current tool
+    caller: str | None = _current_tool.get()
+
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT code, input_schema FROM tool_registry "
@@ -268,10 +361,28 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
             f"Tool '{tool_name}' must define `async def run(args: dict) -> ...:`"
         )
 
-    if inspect.iscoroutinefunction(run_fn):
-        return await run_fn(arguments)
-    else:
-        return run_fn(arguments)
+    # Mark ourselves as the current tool for any nested _dispatch calls.
+    # The finally block restores the parent context unconditionally.
+    token = _current_tool.set(tool_name)
+    try:
+        if inspect.iscoroutinefunction(run_fn):
+            result = await run_fn(arguments)
+        else:
+            result = run_fn(arguments)
+    finally:
+        _current_tool.reset(token)  # Always restore — exception-safe
+
+    # Record execution edge fire-and-forget — zero latency impact on tool call.
+    # Conditions: real caller, not a self-call, neither side in skip list.
+    if (
+        caller is not None
+        and caller != tool_name
+        and caller    not in _EXEC_SKIP
+        and tool_name not in _EXEC_SKIP
+    ):
+        asyncio.create_task(_record_call_edge(caller, tool_name))
+
+    return result
 
 
 # ---------------------------------------------------------------------------
