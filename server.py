@@ -366,20 +366,21 @@ async def lifespan(app: FastAPI):
             except Exception: log.exception("Secret refresh failed")
 
     refresh_task = asyncio.create_task(_secret_refresh())
-    try:
-        yield
-    finally:
-        refresh_task.cancel()
-        if _active_requests > 0:
-            log.info("Shutdown: draining %d requests (max 8s)...", _active_requests)
-            for _ in range(80):
-                if _active_requests == 0: break
-                await asyncio.sleep(0.1)
+    async with mcp.session_manager.run():
+        try:
+            yield
+        finally:
+            refresh_task.cancel()
             if _active_requests > 0:
-                log.warning("Shutdown: %d requests still active — proceeding", _active_requests)
-        _CODE_CACHE.clear()
-        await db_pool.close()
-        log.info("Shutdown complete")
+                log.info("Shutdown: draining %d requests (max 8s)...", _active_requests)
+                for _ in range(80):
+                    if _active_requests == 0: break
+                    await asyncio.sleep(0.1)
+                if _active_requests > 0:
+                    log.warning("Shutdown: %d requests still active — proceeding", _active_requests)
+            _CODE_CACHE.clear()
+            await db_pool.close()
+            log.info("Shutdown complete")
 
 # ============================================================================
 # FASTMCP + FASTAPI
@@ -389,6 +390,10 @@ mcp = FastMCP(
     "MillerMCPGateway", stateless_http=True, json_response=True,
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
+
+# Build sub-app once (initializes session_manager lazily).
+# Must happen before lifespan so session_manager.run() can be entered.
+_mcp_sub_app = mcp.streamable_http_app()
 
 @mcp.tool()
 async def meta_tool(tool_name: str, arguments: Any = None) -> Any:
@@ -470,4 +475,6 @@ async def health():
         "compile_cache_size": len(_CODE_CACHE), "active_requests": _active_requests,
     }
 
-app.mount("/mcp", mcp.streamable_http_app())
+# Mount at / so FastMCP's internal /mcp route is reachable at /mcp externally.
+app.mount("/", _mcp_sub_app)
+
