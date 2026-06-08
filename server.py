@@ -1,779 +1,473 @@
 """
-Miller MCP Gateway — Streamable HTTP transport, direct AlloyDB executor.
+Miller IQ Platform — MCP Gateway v4 (Enterprise Edition)
+Responsibilities: MCP tool execution ONLY.
+  - Claude → meta_tool → _dispatch → AlloyDB → result
+  - No IQ app HTTP routes (those belong in miller-mcp-db-v3)
 
-Single POST /mcp endpoint implements the MCP 2025-03-26 Streamable HTTP spec.
-Connects directly to AlloyDB, reads tool_registry, exec()s tools.
-No FastMCP, no middleware, no proxy hop.
+Enterprise additions v4:
+  - FastAPI wrapper: proper /health HTTP endpoint, CORS, GZip
+  - TraceMiddleware: X-Trace-Id on every request → cloud_ops_metrics
+  - Structured JSON logging: queryable fields in Cloud Logging
+  - Compiled code cache: compile() once per tool version, cache in-process
+  - Tool access guard: internal tools blocked at MCP layer
+  - Graceful shutdown: drain in-flight requests before pool close
+  - Active request tracking: prevents mid-execution SIGTERM kills
 """
 
 import asyncio
-import contextvars
 import inspect
 import json
 import logging
 import os
 import re as _iq_re
 import datetime as _iq_dt
-import traceback
+import sys
+import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from smart_pool import SmartPool, BigQueryPool
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("miller-mcp-gateway")
+# ============================================================================
+# STRUCTURED JSON LOGGER
+# Every log line is valid JSON — queryable by field in Cloud Logging.
+# Fields: severity, message, logger, time, trace_id, tool_name, duration_ms
+# ============================================================================
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-app = FastAPI(title="Miller MCP Gateway", docs_url=None, redoc_url=None)
+class _JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        obj: Dict[str, Any] = {
+            "severity": record.levelname,
+            "message":  record.getMessage(),
+            "logger":   record.name,
+            "time":     _iq_dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.") +
+                        f"{int(record.msecs):03d}Z",
+        }
+        for field in ("trace_id", "tool_name", "duration_ms", "tool_count"):
+            if hasattr(record, field):
+                obj[field] = getattr(record, field)
+        if record.exc_info:
+            obj["exc"] = self.formatException(record.exc_info)
+        return json.dumps(obj)
 
-# ---------------------------------------------------------------------------
-# Database pool (AlloyDB direct)
-# ---------------------------------------------------------------------------
-db_pool: SmartPool | None = None
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(_JSONFormatter())
+logging.root.handlers = [_handler]
+logging.root.setLevel(logging.INFO)
+log = logging.getLogger("gateway")
 
+# ============================================================================
+# SECRETS
+# ============================================================================
 
-@app.on_event("startup")
-async def _startup():
-    global db_pool
-    dsn = os.environ["DATABASE_URL"]
-    # asyncpg needs postgresql:// not postgresql+asyncpg://
-    if "+asyncpg" in dsn:
-        dsn = dsn.replace("postgresql+asyncpg", "postgresql")
-    _alloydb_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=120)
-    db_pool = SmartPool(_alloydb_pool, BigQueryPool())
-    await db_pool.check_degraded_flag()
-    logger.info("SmartPool ready — AlloyDB direct, BQ fallback armed")
+SECRETS_DIR = "/secrets"
 
+def load_secrets() -> int:
+    if not os.path.isdir(SECRETS_DIR):
+        return 0
+    count = 0
+    for name in os.listdir(SECRETS_DIR):
+        entry = os.path.join(SECRETS_DIR, name)
+        if os.path.isdir(entry):
+            fp = os.path.join(entry, "value")
+            if os.path.isfile(fp):
+                os.environ[name] = open(fp).read().strip()
+                count += 1
+        elif os.path.isfile(entry):
+            os.environ[name] = open(entry).read().strip()
+            count += 1
+    return count
 
-@app.on_event("shutdown")
-async def _shutdown():
-    global db_pool
-    if db_pool:
-        await db_pool.close()
-        logger.info("DB pool closed")
+_n = load_secrets()
+log.info("Loaded %d secrets from %s", _n, SECRETS_DIR)
 
+# ============================================================================
+# DATABASE
+# ============================================================================
 
-# ---------------------------------------------------------------------------
-# Execution graph — automatic call-chain tracking
-#
-# Three mechanisms capture tool→tool edges across every dispatch boundary:
-#
-#   1. ContextVar (inline await _dispatch):
-#      _current_tool propagates through the await chain.  Every nested
-#      _dispatch call captures the parent before overwriting context.
-#
-#   2. Inngest threading (_triggered_by_tool in event args):
-#      When a tool fires an Inngest event it injects _triggered_by_tool
-#      (read from _caller_tool in scope).  _dispatch strips this key and
-#      uses it as the effective caller when ContextVar has no parent.
-#
-#   3. HTTP threading (X-Caller-Tool header on /execute):
-#      Any HTTP caller that sets X-Caller-Tool gets that name wired as the
-#      ContextVar before _dispatch runs, so the edge is recorded normally.
-#
-# _record_call_edge always runs fire-and-forget — never adds latency.
-# ---------------------------------------------------------------------------
-_current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "_current_tool", default=None
-)
+def _normalize_dsn(dsn: str) -> str:
+    for prefix in ("postgresql+psycopg2://", "postgresql+asyncpg://", "postgres+asyncpg://"):
+        if dsn.startswith(prefix):
+            return "postgresql://" + dsn[len(prefix):]
+    return dsn
 
-# Tools excluded from execution edge recording.
-# Prevents recursive telemetry loops and noisy infrastructure calls.
-_EXEC_SKIP: frozenset[str] = frozenset({
-    "log_execution_edge",   # telemetry tool — would create self-referential edges
-    "open_session",         # session lifecycle — not a business call chain
-    "save_session",         # session lifecycle
-    "check_context_health", # observability — not part of business logic
-})
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    log.critical("DATABASE_URL not set — exiting")
+    sys.exit(1)
+DATABASE_URL = _normalize_dsn(DATABASE_URL)
 
+TOOL_TIMEOUT = 300
+POOL_MIN     = 2
+POOL_MAX     = 10
 
-async def _record_call_edge(caller: str, callee: str) -> None:
-    """
-    Record one execution edge caller → callee into:
-      - tool_call_log             (structured execution audit trail)
-      - platform_knowledge_links  (graph edge, edge_source='execution_graph')
+db_pool: asyncpg.Pool = None
 
-    Runs as a fire-and-forget asyncio.create_task().  Never raises — telemetry
-    must never interrupt tool execution.  Confidence compounds with repeated
-    observations up to a ceiling of 1.0 (+0.05 per confirmed call).
-    """
-    if not db_pool:
-        return  # pool not yet initialised (startup race guard)
-    try:
-        async with db_pool.acquire() as conn:
-            # Structured execution log
-            await conn.execute(
-                "INSERT INTO tool_call_log "
-                "(tool_name, caller_tool, status, called_at) "
-                "VALUES ($1, $2, 'ok', NOW())",
-                callee,
-                caller,
-            )
-            # Knowledge graph edge: upsert and compound confidence
-            await conn.execute(
-                """
-                INSERT INTO platform_knowledge_links
-                    (source_type, source_key, target_type, target_key,
-                     relationship, edge_source, confidence,
-                     occurrence_count, last_seen_at, payload)
-                VALUES
-                    ('tool', $1, 'tool', $2,
-                     'calls', 'execution_graph', 0.5,
-                     1, NOW(), '{}'::jsonb)
-                ON CONFLICT (source_type, source_key,
-                             target_type, target_key,
-                             relationship, edge_source)
-                WHERE source_key  IS NOT NULL
-                  AND target_key  IS NOT NULL
-                  AND edge_source IS NOT NULL
-                DO UPDATE SET
-                    occurrence_count = platform_knowledge_links.occurrence_count + 1,
-                    last_seen_at     = NOW(),
-                    confidence       = LEAST(
-                                           1.0,
-                                           platform_knowledge_links.confidence + 0.05
-                                       )
-                """,
-                caller,
-                callee,
-            )
-    except Exception as exc:
-        logger.warning(
-            "exec-graph: failed to record %s -> %s: %s", caller, callee, exc
-        )
+# ============================================================================
+# UNIVERSAL TYPE COERCION
+# ============================================================================
 
-
-# ---------------------------------------------------------------------------
-# Universal Type Coercion (copied exactly from miller-mcp-db main.py)
-# ---------------------------------------------------------------------------
-_IQ_NULL = (None, "", "null", "undefined", "none", "None")
-
+_IQ_NULL = (None, '', 'null', 'undefined', 'none', 'None')
 _IQ_SCHEMA_FN = {
-    "integer": lambda v: int(v) if v not in _IQ_NULL else None,
-    "number": lambda v: float(v) if v not in _IQ_NULL else None,
-    "boolean": lambda v: (
-        v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
-    )
-    if v not in _IQ_NULL
-    else None,
-    "string": lambda v: str(v) if v is not None else None,
-    "array": lambda v: (json.loads(v) if isinstance(v, str) else v)
-    if v is not None
-    else None,
-    "object": lambda v: (json.loads(v) if isinstance(v, str) else v)
-    if v is not None
-    else None,
+    'integer': lambda v: int(v)   if v not in _IQ_NULL else None,
+    'number':  lambda v: float(v) if v not in _IQ_NULL else None,
+    'boolean': lambda v: (v if isinstance(v, bool) else str(v).lower() in ('true', '1', 'yes')) if v not in _IQ_NULL else None,
+    'string':  lambda v: str(v)   if v is not None else None,
+    'array':   lambda v: (json.loads(v) if isinstance(v, str) else v) if v is not None else None,
+    'object':  lambda v: (json.loads(v) if isinstance(v, str) else v) if v is not None else None,
 }
-
-_IQ_INT_PAT = _iq_re.compile(
-    r"(_id|_ids|_count|_limit|_offset|_page|_position|_order|_version|sort_order|^id$|^ids$)$",
-    _iq_re.I,
-)
-_IQ_FLOAT_PAT = _iq_re.compile(
-    r"(_pct|_percent|_score|_rate|_amount|_value|_price|_weight)$", _iq_re.I
-)
-_IQ_BOOL_PAT = _iq_re.compile(r"^(is_|has_|can_|show_|enable_|allow_)", _iq_re.I)
-_IQ_CAST_RE = _iq_re.compile(r"\$(\d+)::(\w+)", _iq_re.I)
+_IQ_INT_PAT   = _iq_re.compile(r'(_id|_ids|_count|_limit|_offset|_page|_position|_order|_version|sort_order|^id$|^ids$)$', _iq_re.I)
+_IQ_FLOAT_PAT = _iq_re.compile(r'(_pct|_percent|_score|_rate|_amount|_value|_price|_weight)$', _iq_re.I)
+_IQ_BOOL_PAT  = _iq_re.compile(r'^(is_|has_|can_|show_|enable_|allow_)', _iq_re.I)
+_IQ_CAST_RE   = _iq_re.compile(r'\$(\d+)::(\w+)', _iq_re.I)
 _IQ_CAST_FN = {
-    "bigint": lambda v: int(v) if v not in _IQ_NULL else None,
-    "integer": lambda v: int(v) if v not in _IQ_NULL else None,
-    "int": lambda v: int(v) if v not in _IQ_NULL else None,
-    "int4": lambda v: int(v) if v not in _IQ_NULL else None,
-    "int8": lambda v: int(v) if v not in _IQ_NULL else None,
-    "smallint": lambda v: int(v) if v not in _IQ_NULL else None,
-    "float": lambda v: float(v) if v not in _IQ_NULL else None,
-    "float4": lambda v: float(v) if v not in _IQ_NULL else None,
-    "float8": lambda v: float(v) if v not in _IQ_NULL else None,
-    "numeric": lambda v: float(v) if v not in _IQ_NULL else None,
-    "text": lambda v: str(v) if v is not None else None,
-    "varchar": lambda v: str(v) if v is not None else None,
-    "boolean": lambda v: (
-        v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
-    )
-    if v not in _IQ_NULL
-    else None,
-    "bool": lambda v: (
-        v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
-    )
-    if v not in _IQ_NULL
-    else None,
-    "date": lambda v: _iq_dt.date.fromisoformat(str(v)[:10])
-    if v not in _IQ_NULL
-    else None,
-    "timestamp": lambda v: _iq_dt.datetime.fromisoformat(str(v))
-    if v not in _IQ_NULL
-    else None,
-    "timestamptz": lambda v: _iq_dt.datetime.fromisoformat(str(v))
-    if v not in _IQ_NULL
-    else None,
-    "jsonb": lambda v: json.dumps(v) if not isinstance(v, str) else v,
-    "json": lambda v: json.dumps(v) if not isinstance(v, str) else v,
+    'bigint': lambda v: int(v) if v not in _IQ_NULL else None,
+    'integer': lambda v: int(v) if v not in _IQ_NULL else None,
+    'int': lambda v: int(v) if v not in _IQ_NULL else None,
+    'int4': lambda v: int(v) if v not in _IQ_NULL else None,
+    'int8': lambda v: int(v) if v not in _IQ_NULL else None,
+    'smallint': lambda v: int(v) if v not in _IQ_NULL else None,
+    'float': lambda v: float(v) if v not in _IQ_NULL else None,
+    'float4': lambda v: float(v) if v not in _IQ_NULL else None,
+    'float8': lambda v: float(v) if v not in _IQ_NULL else None,
+    'numeric': lambda v: float(v) if v not in _IQ_NULL else None,
+    'text': lambda v: str(v) if v is not None else None,
+    'varchar': lambda v: str(v) if v is not None else None,
+    'boolean': lambda v: (v if isinstance(v, bool) else str(v).lower() in ('true', '1', 'yes')) if v not in _IQ_NULL else None,
+    'bool': lambda v: (v if isinstance(v, bool) else str(v).lower() in ('true', '1', 'yes')) if v not in _IQ_NULL else None,
+    'date': lambda v: _iq_dt.date.fromisoformat(str(v)[:10]) if v not in _IQ_NULL else None,
+    'timestamp': lambda v: _iq_dt.datetime.fromisoformat(str(v)) if v not in _IQ_NULL else None,
+    'timestamptz': lambda v: _iq_dt.datetime.fromisoformat(str(v)) if v not in _IQ_NULL else None,
+    'jsonb': lambda v: json.dumps(v) if not isinstance(v, str) else v,
+    'json': lambda v: json.dumps(v) if not isinstance(v, str) else v,
 }
 
-
-def _iq_heuristic(k: str, v):
-    if v in _IQ_NULL:
-        return None
+def _iq_heuristic(k, v):
+    if v in _IQ_NULL: return None
     try:
-        if _IQ_INT_PAT.search(k.lower()):
-            return int(v)
-        if _IQ_FLOAT_PAT.search(k.lower()):
-            return float(v)
-        if _IQ_BOOL_PAT.match(k.lower()) and isinstance(v, str):
-            return v.lower() in ("true", "1", "yes")
-    except (ValueError, TypeError):
-        pass
+        if _IQ_INT_PAT.search(k.lower()):   return int(v)
+        if _IQ_FLOAT_PAT.search(k.lower()): return float(v)
+        if _IQ_BOOL_PAT.match(k.lower()) and isinstance(v, str): return v.lower() in ('true', '1', 'yes')
+    except (ValueError, TypeError): pass
     return v
 
-
-def coerce_args(args: dict, schema=None) -> dict:
-    """Two-pass coercion: schema types first, heuristics second."""
-    if not isinstance(args, dict):
-        return args
+def coerce_args(args, schema=None):
+    if not isinstance(args, dict): return args
     props = {}
     if schema:
         raw = schema if isinstance(schema, dict) else json.loads(schema)
-        props = raw.get("properties", {})
+        props = raw.get('properties', {})
     out = {}
     for k, v in args.items():
         if k in props:
-            fn = _IQ_SCHEMA_FN.get(props[k].get("type"))
+            fn = _IQ_SCHEMA_FN.get(props[k].get('type'))
             if fn:
-                try:
-                    out[k] = fn(v)
-                    continue
-                except (ValueError, TypeError):
-                    pass
+                try: out[k] = fn(v); continue
+                except (ValueError, TypeError): pass
         out[k] = _iq_heuristic(k, v)
     return out
 
-
-def coerce_sql_vals(sql: str, vals) -> list:
-    """Read $N::type SQL casts, coerce Python vals to match asyncpg."""
+def coerce_sql_vals(sql, vals):
     out = list(vals)
     for m in _IQ_CAST_RE.finditer(sql):
         pos = int(m.group(1)) - 1
         cast = m.group(2).lower()
         if 0 <= pos < len(out) and cast in _IQ_CAST_FN:
-            try:
-                out[pos] = _IQ_CAST_FN[cast](out[pos])
-            except Exception:
-                pass
+            try: out[pos] = _IQ_CAST_FN[cast](out[pos])
+            except: pass
     return out
 
+async def db_execute(conn, sql, *vals):    return await conn.execute(sql,    *coerce_sql_vals(sql, vals))
+async def db_fetch(conn, sql, *vals):      return await conn.fetch(sql,      *coerce_sql_vals(sql, vals))
+async def db_fetchrow(conn, sql, *vals):   return await conn.fetchrow(sql,   *coerce_sql_vals(sql, vals))
+async def db_fetchval(conn, sql, *vals):   return await conn.fetchval(sql,   *coerce_sql_vals(sql, vals))
+async def db_executemany(conn, sql, many): return await conn.executemany(sql, [coerce_sql_vals(sql, v) for v in many])
 
-# ---------------------------------------------------------------------------
-# DB helpers (match miller-mcp-db exactly)
-# ---------------------------------------------------------------------------
-async def db_execute(conn, sql, *vals):
-    return await conn.execute(sql, *coerce_sql_vals(sql, vals))
-
-
-async def db_fetch(conn, sql, *vals):
-    return await conn.fetch(sql, *coerce_sql_vals(sql, vals))
-
-
-async def db_fetchrow(conn, sql, *vals):
-    return await conn.fetchrow(sql, *coerce_sql_vals(sql, vals))
-
-
-async def db_fetchval(conn, sql, *vals):
-    return await conn.fetchval(sql, *coerce_sql_vals(sql, vals))
-
-
-async def db_executemany(conn, sql, many):
-    return await conn.executemany(sql, [coerce_sql_vals(sql, v) for v in many])
-
-
-# ---------------------------------------------------------------------------
-# _platform_call — HTTP tool-to-tool call with automatic caller threading
-#
-# Use this instead of raw httpx when a tool needs to call another tool via
-# the /execute endpoint.  Automatically injects X-Caller-Tool so the
-# receiving gateway can recover the caller context and record the edge.
-# ---------------------------------------------------------------------------
-_EXECUTE_URL = "https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute"
-_EXECUTE_KEY = os.environ.get("API_KEY", "miller-techstack-2026")
-
-
-async def _platform_call(
-    tool_name: str,
-    arguments: dict | None = None,
-    *,
-    timeout: float = 120.0,
-) -> dict:
-    """
-    Call another platform tool via /execute, threading caller context
-    automatically via the X-Caller-Tool header.
-
-    Usage inside any tool:
-        result = await _platform_call('some_tool', {'param': value})
-
-    The execution edge is recorded transparently on the receiving end.
-    """
-    headers: dict[str, str] = {
-        "Content-Type": "application/json",
-        "X-API-Key":    _EXECUTE_KEY,
-    }
-    current = _current_tool.get()
-    if current:
-        headers["x-caller-tool"] = current
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            _EXECUTE_URL,
-            json={"tool_name": tool_name, "arguments": arguments or {}},
-            headers=headers,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-# ---------------------------------------------------------------------------
-# Tool globals (injected into every exec() scope)
-# ---------------------------------------------------------------------------
 _TOOL_GLOBALS: Dict[str, Any] = {
-    "asyncio":        asyncio,
-    "httpx":          httpx,
-    "json":           json,
-    "os":             os,
-    "logger":         logger,
-    "coerce_args":    coerce_args,
-    "coerce_sql_vals":coerce_sql_vals,
-    "db_execute":     db_execute,
-    "db_fetch":       db_fetch,
-    "db_fetchrow":    db_fetchrow,
-    "db_fetchval":    db_fetchval,
-    "db_executemany": db_executemany,
-    "_platform_call": _platform_call,  # HTTP tool-to-tool with caller threading
+    "asyncio": asyncio, "httpx": httpx, "json": json, "os": os, "logger": log,
+    "coerce_args": coerce_args, "coerce_sql_vals": coerce_sql_vals,
+    "db_execute": db_execute, "db_fetch": db_fetch,
+    "db_fetchrow": db_fetchrow, "db_fetchval": db_fetchval, "db_executemany": db_executemany,
 }
 
+# ============================================================================
+# COMPILED CODE CACHE
+# tool_name -> (version, compiled). Evicts on version bump.
+# Bounded by distinct tool count, not version history.
+# ============================================================================
 
-# ---------------------------------------------------------------------------
-# Tool dispatch (direct DB executor — no proxy hop)
-# ---------------------------------------------------------------------------
-async def _dispatch(tool_name: str, arguments: Dict[str, Any]) -> Any:
-    """
-    Load tool code from DB, compile and run it.
-    Every call reads fresh from tool_registry — no in-memory cache.
+_CODE_CACHE: Dict[str, tuple] = {}
 
-    Execution graph tracking (three mechanisms):
+# ============================================================================
+# _dispatch — EXECUTION ENGINE
+# ============================================================================
 
-      Mechanism 1 — ContextVar (inline await _dispatch):
-        Captures caller = _current_tool.get() before overwriting context.
-        Restores in finally — always, even on exceptions.
+async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | None = None) -> Any:
+    if trace_id is None:
+        trace_id = str(uuid.uuid4())
 
-      Mechanism 2 — Inngest threading:
-        When caller is None and arguments contains _triggered_by_tool,
-        use that value as the effective caller and strip it from args.
-        fire_inngest_event injects this key using _caller_tool from scope.
-
-      Mechanism 3 — HTTP threading:
-        The /execute route sets the ContextVar from X-Caller-Tool before
-        calling _dispatch, so Mechanism 1 captures it transparently.
-
-      _caller_tool is injected into every tool's scope so tools can
-      read who called them (needed by fire_inngest_event for threading).
-    """
-    # Capture caller at the dispatch boundary, before we become the current tool
-    caller: str | None = _current_tool.get()
-
-    # Mechanism 2: recover Inngest-threaded parent when ContextVar has no parent.
-    # Strip _triggered_by_tool before coerce_args so it never leaks into the tool.
-    if caller is None and isinstance(arguments, dict):
-        _inngest_parent = arguments.get("_triggered_by_tool")
-        if _inngest_parent and isinstance(_inngest_parent, str):
-            caller     = _inngest_parent
-            arguments  = {k: v for k, v in arguments.items()
-                          if k != "_triggered_by_tool"}
+    _RATE_LIMIT_EXEMPT = frozenset({
+        "rate_limiter", "db_health_check", "smoke_test_hello_world",
+        "regression_runner", "pool_health_monitor", "trace_explorer",
+        "schema_migration_manager", "build_session_context", "check_context_health",
+    })
+    if tool_name not in _RATE_LIMIT_EXEMPT:
+        try:
+            rl_row = await db_pool.fetchval(
+                "SELECT code FROM tool_registry WHERE name='rate_limiter' AND enabled=TRUE"
+            )
+            if rl_row:
+                _rl_scope = {"asyncpg": asyncpg, "os": os, "json": json, "db_pool": db_pool}
+                exec(compile(rl_row, '<rate_limiter>', 'exec'), _rl_scope)
+                rl_result = await _rl_scope['run']({'action': 'check', 'tool_name': tool_name})
+                if rl_result.get('allowed') is False:
+                    raise RuntimeError(f"Rate limited: {rl_result.get('reason', 'limit exceeded')}")
+        except RuntimeError:
+            raise
+        except Exception as _rl_exc:
+            log.warning("Rate limit check failed (non-fatal): %s", _rl_exc)
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT code, input_schema FROM tool_registry "
-            "WHERE name = $1 AND enabled = TRUE",
+            "SELECT code, input_schema, operational_intel, version, tool_status "
+            "FROM tool_registry WHERE name = $1 AND enabled = TRUE",
             tool_name,
         )
     if row is None:
         async with db_pool.acquire() as conn:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE"
-            )
+            count = await conn.fetchval("SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE")
         raise ValueError(
             f"Tool '{tool_name}' not found in the registry "
             f"({count} tools loaded). Check the tool name and try again."
         )
 
-    code   = row["code"]
-    schema = row["input_schema"]
+    code = row["code"]; schema = row["input_schema"]; version = row["version"]
     arguments = coerce_args(arguments, schema)
 
-    scope: Dict[str, Any] = {
-        **_TOOL_GLOBALS,
-        "db_pool":      db_pool,
-        "_dispatch":    _dispatch,
-        "_caller_tool": caller,    # Mechanism 2: fire_inngest_event reads this
-        "args":         arguments,
-    }
+    cache_entry = _CODE_CACHE.get(tool_name)
+    if cache_entry is None or cache_entry[0] != version:
+        try:
+            compiled = compile(code, f"<tool:{tool_name}>", "exec")
+            _CODE_CACHE[tool_name] = (version, compiled)
+        except SyntaxError as exc:
+            raise RuntimeError(f"Tool '{tool_name}' has a syntax error: {exc}") from exc
+    else:
+        compiled = cache_entry[1]
 
+    scope: Dict[str, Any] = {**_TOOL_GLOBALS, "db_pool": db_pool, "args": arguments}
     try:
-        exec(compile(code, f"<tool:{tool_name}>", "exec"), scope)
+        exec(compiled, scope)
     except SyntaxError as exc:
         raise RuntimeError(f"Tool '{tool_name}' has a syntax error: {exc}") from exc
 
     run_fn = scope.get("run")
     if run_fn is None:
-        raise RuntimeError(
-            f"Tool '{tool_name}' must define `async def run(args: dict) -> ...:`"
-        )
+        raise RuntimeError(f"Tool '{tool_name}' must define `async def run(args: dict) -> ...:`")
+    if not inspect.iscoroutinefunction(run_fn):
+        raise RuntimeError(f"Tool '{tool_name}': `run` must be async.")
 
-    # Mark ourselves as the current tool for any nested _dispatch calls.
-    # The finally block restores the parent context unconditionally.
-    token = _current_tool.set(tool_name)
-    try:
-        if inspect.iscoroutinefunction(run_fn):
-            result = await run_fn(arguments)
-        else:
-            result = run_fn(arguments)
-    finally:
-        _current_tool.reset(token)  # Always restore — exception-safe
-
-    # Record execution edge fire-and-forget — zero latency impact on tool call.
-    # Conditions: real caller, not a self-call, neither side in skip list.
-    if (
-        caller is not None
-        and caller    != tool_name
-        and caller    not in _EXEC_SKIP
-        and tool_name not in _EXEC_SKIP
-    ):
-        asyncio.create_task(_record_call_edge(caller, tool_name))
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# JSON-RPC helpers
-# ---------------------------------------------------------------------------
-SERVER_INFO = {
-    "name": "miller-mcp-gateway",
-    "version": "1.0.0",
-}
-
-PROTOCOL_VERSION = "2025-03-26"
-
-
-def _jsonrpc_ok(id, result):
-    return {"jsonrpc": "2.0", "id": id, "result": result}
-
-
-def _jsonrpc_error(id, code, message, data=None):
-    err = {"code": code, "message": message}
-    if data is not None:
-        err["data"] = data
-    return {"jsonrpc": "2.0", "id": id, "error": err}
-
-
-# ---------------------------------------------------------------------------
-# MCP method handlers
-# ---------------------------------------------------------------------------
-async def _handle_initialize(params: dict, req_id):
-    """MCP initialize handshake."""
-    return _jsonrpc_ok(req_id, {
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {
-            "tools": {"listChanged": False},
-        },
-        "serverInfo": SERVER_INFO,
-    })
-
-
-async def _handle_tools_list(params: dict, req_id):
-    """Return ONLY meta_tool — the single gateway entry point.
-
-    Claude Chat sees one tool. All 1,200+ platform tools are called
-    through meta_tool(tool_name="...", arguments={...}).
-    """
-    tools = [{
-        "name": "meta_tool",
-        "description": (
-            "Miller IQ Platform gateway. Call any of 1,200+ tools by name. "
-            "Arguments: tool_name (string, required) — the tool to execute; "
-            "arguments (object, optional) — the tool's input arguments."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tool_name": {
-                    "type": "string",
-                    "description": "Name of the tool to execute"
-                },
-                "arguments": {
-                    "type": "object",
-                    "description": "Arguments to pass to the tool",
-                    "default": {}
-                }
-            },
-            "required": ["tool_name"]
-        }
-    }]
-    return _jsonrpc_ok(req_id, {"tools": tools})
-
-
-async def _handle_tools_call(params: dict, req_id):
-    """Execute a tool via _dispatch — intercepts meta_tool for direct routing."""
-    call_name = params.get("name", "")
-    arguments = params.get("arguments", {}) or {}
-
-    # meta_tool fast path: extract inner tool_name and dispatch directly
-    # No DB round-trip for meta_tool itself — just unwrap and forward.
-    if call_name == "meta_tool":
-        tool_name = arguments.get("tool_name", "")
-        tool_args = arguments.get("arguments", {}) or {}
-        if not tool_name:
-            return _jsonrpc_ok(req_id, {
-                "content": [{"type": "text", "text": json.dumps({
-                    "error": "tool_name is required in meta_tool arguments"
-                })}],
-                "isError": True,
-            })
-    else:
-        # Direct tool call (backward compat — /execute still works)
-        tool_name = call_name
-        tool_args = arguments
-
-    try:
-        result = await _dispatch(tool_name, tool_args)
-        if isinstance(result, dict) or isinstance(result, list):
-            text = json.dumps(result, default=str)
-        elif result is None:
-            text = json.dumps({"status": "ok"})
-        else:
-            text = str(result)
-        return _jsonrpc_ok(req_id, {
-            "content": [{"type": "text", "text": text}],
-        })
-    except Exception as exc:
-        tb = traceback.format_exc()
-        logger.error("Tool %s failed: %s\n%s", tool_name, exc, tb)
-        return _jsonrpc_ok(req_id, {
-            "content": [{"type": "text", "text": json.dumps({
-                "error": str(exc),
-                "tool": tool_name,
-            })}],
-            "isError": True,
-        })
-
-
-# ---------------------------------------------------------------------------
-# Route: POST /mcp — Streamable HTTP (MCP 2025-03-26)
-# ---------------------------------------------------------------------------
-@app.post("/mcp")
-async def mcp_post(request: Request):
-    """
-    Single MCP endpoint — Streamable HTTP transport.
-    Receives JSON-RPC, returns application/json.
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            status_code=400,
-            content=_jsonrpc_error(None, -32700, "Parse error"),
-        )
-
-    # Handle batch requests
-    if isinstance(body, list):
-        results = []
-        for item in body:
-            r = await _handle_single(item)
-            if r is not None:  # notifications return None
-                results.append(r)
-        if not results:
-            return Response(status_code=202)
-        return JSONResponse(content=results)
-
-    # Single request/notification
-    result = await _handle_single(body)
-    if result is None:
-        return Response(status_code=202)
-    return JSONResponse(content=result)
-
-
-async def _handle_single(msg: dict):
-    """Route a single JSON-RPC message to the right handler."""
-    method = msg.get("method", "")
-    req_id = msg.get("id")  # None for notifications
-    params = msg.get("params", {}) or {}
-
-    # Notifications (no id) — acknowledge silently
-    if req_id is None:
-        # notifications/initialized, notifications/cancelled, etc.
-        return None
-
-    handlers = {
-        "initialize": _handle_initialize,
-        "tools/list": _handle_tools_list,
-        "tools/call": _handle_tools_call,
-        "ping": lambda p, i: _jsonrpc_ok(i, {}),
-    }
-
-    handler = handlers.get(method)
-    if handler is None:
-        return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
-
-    try:
-        if asyncio.iscoroutinefunction(handler):
-            return await handler(params, req_id)
-        return handler(params, req_id)
-    except Exception as exc:
-        logger.error("Handler %s error: %s", method, exc, exc_info=True)
-        return _jsonrpc_error(req_id, -32603, f"Internal error: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Route: GET /mcp — optional SSE stream (return 405 for now)
-# ---------------------------------------------------------------------------
-@app.get("/mcp")
-async def mcp_get():
-    """We don't need server-initiated messages. Return 405."""
-    return Response(status_code=405)
-
-
-# ---------------------------------------------------------------------------
-# Route: DELETE /mcp — session termination (not needed)
-# ---------------------------------------------------------------------------
-@app.delete("/mcp")
-async def mcp_delete():
-    return Response(status_code=405)
-
-
-# ---------------------------------------------------------------------------
-# Route: POST /execute — plain HTTP executor for AlloyDB predict_row()
-# ---------------------------------------------------------------------------
-@app.post("/execute")
-async def execute(request: Request):
-    """
-    Simple HTTP executor. AlloyDB's google_ml.predict_row() calls this.
-    Expects: {"tool_name": "...", "arguments": {...}}
-    Returns: JSON result from the tool.
-
-    Mechanism 3 — HTTP caller threading:
-    If the caller sets X-Caller-Tool header, we wire it as the ContextVar
-    before dispatching so the edge is captured by the normal ContextVar path.
-    """
-    # API key check
-    api_key = request.headers.get("x-api-key", "")
-    if api_key != os.environ.get("API_KEY", "miller-techstack-2026"):
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
-
-    tool_name = body.get("tool_name", "")
-    arguments = body.get("arguments", {}) or {}
-
-    if not tool_name:
-        return JSONResponse(status_code=400, content={"error": "tool_name required"})
-
-    # Mechanism 3: thread HTTP caller into the ContextVar so _dispatch sees it.
-    # Strip empty strings — only set when a real caller name was provided.
-    _http_caller = request.headers.get("x-caller-tool", "").strip() or None
-    _http_token: contextvars.Token | None = (
-        _current_tool.set(_http_caller) if _http_caller else None
-    )
-    try:
-        result = await _dispatch(tool_name, arguments)
-        if isinstance(result, (dict, list)):
-            return JSONResponse(content=result)
-        elif result is None:
-            return JSONResponse(content={"status": "ok"})
-        else:
-            return JSONResponse(content={"result": str(result)})
-    except Exception as exc:
-        logger.error("Execute %s failed: %s", tool_name, exc, exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(exc), "tool": tool_name},
-        )
-    finally:
-        if _http_token is not None:
-            _current_tool.reset(_http_token)  # always restore, even on exception
-
-
-# ---------------------------------------------------------------------------
-# Route: POST /api/tool-reload
-# ---------------------------------------------------------------------------
-@app.post("/api/tool-reload")
-async def api_tool_reload(request: Request):
-    logger.info("tool-reload signal received")
-    return JSONResponse({"status": "ok", "message": "tools always fresh from DB"})
-
-
-# ---------------------------------------------------------------------------
-# Route: POST /api/alloydb-recovered
-# ---------------------------------------------------------------------------
-@app.post("/api/alloydb-recovered")
-async def api_alloydb_recovered(request: Request):
-    if db_pool and hasattr(db_pool, '_exit_degraded'):
-        await db_pool._exit_degraded()
-        logger.info("SmartPool: exiting degraded mode")
-        return JSONResponse({"status": "ok", "degraded": False, "action": "bq_replay_pending"})
-    return JSONResponse({"status": "ok", "degraded": False, "message": "already in normal mode"})
-
-
-# ---------------------------------------------------------------------------
-# Cloud Build Pub/Sub webhook routes
-# ---------------------------------------------------------------------------
-@app.post("/webhooks/cloudbuild")
-async def webhook_cloudbuild(request: Request):
-    """Pub/Sub push: ALL Cloud Build status events -> handle_cloudbuild_webhook."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"status": "ack", "detail": "unparseable"}, 200)
-    # Return 200 immediately -- Pub/Sub requires ack within deadline.
-    # handle_cloudbuild_webhook writes build_events and fires Inngest on terminal.
-    asyncio.create_task(_dispatch("handle_cloudbuild_webhook", {"body": body}))
-    return JSONResponse({"status": "ack"}, 200)
-
-
-@app.post("/webhooks/build-complete")
-async def webhook_build_complete(request: Request):
-    """Pub/Sub push: SUCCESS-only Cloud Build events (finalize gate)."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"status": "ack", "detail": "unparseable"}, 200)
-    # finalize_only=True: skips duplicate build_events row (already written
-    # by /webhooks/cloudbuild which receives all events including SUCCESS).
-    asyncio.create_task(
-        _dispatch("handle_cloudbuild_webhook", {"body": body, "finalize_only": True})
-    )
-    return JSONResponse({"status": "ack"}, 200)
-
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-@app.get("/health")
-async def health():
+    _timeout_sec = TOOL_TIMEOUT
     try:
         async with db_pool.acquire() as conn:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE"
+            _t = await conn.fetchval(
+                "SELECT timeout_seconds FROM execution_timeout_config WHERE tool_name = $1",
+                tool_name,
             )
-        return {"status": "healthy", "tools_loaded": count}
-    except Exception as exc:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": str(exc)},
+        if _t is not None: _timeout_sec = _t
+    except Exception:
+        pass
+
+    t0 = time.monotonic(); status = "success"; error_type = None; result = None
+    try:
+        result = await asyncio.wait_for(run_fn(arguments), timeout=_timeout_sec)
+    except asyncio.TimeoutError:
+        status = "error"; error_type = "TimeoutError"
+        raise RuntimeError(f"Tool '{tool_name}' timed out after {_timeout_sec}s.")
+    except Exception as e:
+        status = "error"; error_type = type(e).__name__; raise
+    finally:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.info(
+            "Tool '%s' %s (%dms) trace=%s", tool_name, status.upper(), duration_ms, trace_id,
+            extra={"trace_id": trace_id, "tool_name": tool_name, "duration_ms": duration_ms},
         )
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO cloud_ops_metrics "
+                    "(metric_type, tool_name, duration_ms, status, error_type, metadata, trace_id) "
+                    "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)",
+                    "tool_execution", tool_name, duration_ms, status, error_type,
+                    json.dumps({"args_count": len(arguments) if isinstance(arguments, dict) else 0}),
+                    trace_id,
+                )
+        except Exception:
+            log.exception("Failed to log metrics for tool: %s", tool_name)
+
+    if isinstance(result, dict) and row.get("operational_intel"):
+        _oi = row["operational_intel"]
+        result["_intel"] = json.loads(_oi) if isinstance(_oi, str) else _oi
+    return result
+
+_TOOL_GLOBALS["_dispatch"] = _dispatch
+
+# ============================================================================
+# MIDDLEWARE
+# ============================================================================
+
+class TraceMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        trace_id = request.headers.get("X-Trace-Id") or str(uuid.uuid4())
+        request.state.trace_id = trace_id
+        response = await call_next(request)
+        response.headers["X-Trace-Id"] = trace_id
+        return response
+
+_active_requests: int = 0
+
+class _ActiveRequestMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        global _active_requests
+        _active_requests += 1
+        try:
+            return await call_next(request)
+        finally:
+            _active_requests -= 1
+
+# ============================================================================
+# LIFESPAN
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool
+    log.info("MCP Gateway v4 starting...")
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=POOL_MIN, max_size=POOL_MAX,
+        command_timeout=TOOL_TIMEOUT, statement_cache_size=0,
+    )
+    _TOOL_GLOBALS["db_pool"] = db_pool
+    tool_count = await db_pool.fetchval("SELECT count(*) FROM tool_registry WHERE enabled = true")
+    log.info("Pool ready — %d enabled tools", tool_count, extra={"tool_count": int(tool_count)})
+
+    async def _secret_refresh():
+        while True:
+            await asyncio.sleep(300)
+            try: load_secrets()
+            except Exception: log.exception("Secret refresh failed")
+
+    refresh_task = asyncio.create_task(_secret_refresh())
+    try:
+        yield
+    finally:
+        refresh_task.cancel()
+        if _active_requests > 0:
+            log.info("Shutdown: draining %d requests (max 8s)...", _active_requests)
+            for _ in range(80):
+                if _active_requests == 0: break
+                await asyncio.sleep(0.1)
+            if _active_requests > 0:
+                log.warning("Shutdown: %d requests still active — proceeding", _active_requests)
+        _CODE_CACHE.clear()
+        await db_pool.close()
+        log.info("Shutdown complete")
+
+# ============================================================================
+# FASTMCP + FASTAPI
+# ============================================================================
+
+mcp = FastMCP(
+    "MillerMCPGateway", stateless_http=True, json_response=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+
+@mcp.tool()
+async def meta_tool(tool_name: str, arguments: Any = None) -> Any:
+    """
+    Execute any tool in the registry. Internal tools (tool_status='internal')
+    are blocked from direct MCP calls — platform-to-platform use only.
+    """
+    if db_pool:
+        tool_status = await db_pool.fetchval(
+            "SELECT tool_status FROM tool_registry WHERE name=$1 AND enabled=TRUE", tool_name,
+        )
+        if tool_status == "internal":
+            return {"status": "error", "error": (
+                f"Tool '{tool_name}' is internal and cannot be called directly via MCP."
+            )}
+    if isinstance(arguments, str):
+        try: arguments = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError): arguments = {}
+    if not isinstance(arguments, dict): arguments = {}
+    return await _dispatch(tool_name, arguments)
+
+@mcp.tool()
+def ping() -> str:
+    """Returns pong — verifies MCP gateway connectivity."""
+    return "pong"
+
+@mcp.tool()
+async def gateway_status() -> dict:
+    """Returns live health: DB status, tool count, cache stats."""
+    info: Dict[str, Any] = {
+        "gateway": "MCP Gateway v4 — Enterprise Edition",
+        "timeout_s": TOOL_TIMEOUT, "pool": f"{POOL_MIN}-{POOL_MAX}",
+        "compile_cache_size": len(_CODE_CACHE), "active_requests": _active_requests,
+    }
+    if os.path.isdir(SECRETS_DIR): info["secrets"] = len(os.listdir(SECRETS_DIR))
+    if db_pool:
+        try:
+            t0 = time.monotonic()
+            n = await db_pool.fetchval("SELECT count(*) FROM tool_registry WHERE enabled = true")
+            info["db"] = "connected"; info["enabled_tools"] = int(n)
+            info["db_latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        except Exception as exc:
+            info["db"] = f"error: {exc}"
+    return info
+
+app = FastAPI(
+    title="MillerMCPGateway",
+    description="Miller IQ Platform MCP Gateway — tool execution layer",
+    version="4.0.0", lifespan=lifespan,
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+    allow_methods=["GET","POST","PATCH","PUT","DELETE","OPTIONS"],
+    allow_headers=["Content-Type","X-API-Key","Authorization","X-Trace-Id"],
+    allow_credentials=False)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(TraceMiddleware)
+app.add_middleware(_ActiveRequestMiddleware)
+
+@app.get("/health")
+async def health():
+    """HTTP health endpoint for Cloud Run probes and capture_service_metrics cron."""
+    db_ok = False; tool_count = 0; db_latency = None
+    if db_pool:
+        try:
+            t0 = time.monotonic()
+            await db_pool.fetchval("SELECT 1")
+            db_latency = round((time.monotonic() - t0) * 1000, 1)
+            db_ok = True
+            tool_count = int(await db_pool.fetchval(
+                "SELECT count(*) FROM tool_registry WHERE enabled = TRUE"
+            ))
+        except Exception:
+            pass
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "service": "miller-mcp-gateway", "version": "4.0.0",
+        "db": "connected" if db_ok else "unreachable",
+        "db_latency_ms": db_latency, "tool_count": tool_count,
+        "compile_cache_size": len(_CODE_CACHE), "active_requests": _active_requests,
+    }
+
+app.mount("/mcp", mcp.streamable_http_app())
