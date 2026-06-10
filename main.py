@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
 import datetime as _iq_dt
+import html as _html
 import inspect
 import json
 import logging
@@ -298,7 +299,7 @@ def coerce_sql_vals(sql: str, vals) -> list:
         cast = m.group(2).lower()
         if 0 <= pos < len(out) and cast in _IQ_CAST_FN:
             try: out[pos] = _IQ_CAST_FN[cast](out[pos])
-            except: pass
+            except Exception: pass
     return out
 
 async def db_execute(conn, sql, *vals):    return await conn.execute(sql,    *coerce_sql_vals(sql, vals))
@@ -334,6 +335,14 @@ _LEARNING_HOOKS: frozenset = frozenset({
     "rollback_service",
     "verify_deployment_health",
     "save_session_smart",
+})
+
+
+# ── Rate limit exemptions (module-level constant, not per-call allocation) ───
+_RATE_LIMIT_EXEMPT: frozenset[str] = frozenset({
+    "rate_limiter", "db_health_check", "smoke_test_hello_world",
+    "regression_runner", "pool_health_monitor", "trace_explorer",
+    "schema_migration_manager", "build_session_context", "check_context_health",
 })
 
 
@@ -374,11 +383,6 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
             arguments = {k: v for k, v in arguments.items()
                          if k != "_triggered_by_tool"}
 
-    _RATE_LIMIT_EXEMPT = frozenset({
-        "rate_limiter", "db_health_check", "smoke_test_hello_world",
-        "regression_runner", "pool_health_monitor", "trace_explorer",
-        "schema_migration_manager", "build_session_context", "check_context_health",
-    })
     if tool_name not in _RATE_LIMIT_EXEMPT:
         try:
             rl_row = await db_pool.fetchval(
@@ -549,6 +553,32 @@ class _ActiveRequestMiddleware(BaseHTTPMiddleware):
             _active_requests -= 1
 
 
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """
+    Enterprise security headers on every HTTP response.
+    HSTS, anti-clickjacking, MIME-sniffing protection, referrer policy,
+    and permissions policy. Registered last so it runs first on response path.
+    """
+    _HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "X-XSS-Protection": "0",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        for key, value in self._HEADERS.items():
+            if key not in response.headers:
+                response.headers[key] = value
+        if request.headers.get("x-forwarded-proto") == "https":
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
+        return response
+
+
 # ============================================================================
 # APP + MCP
 # ============================================================================
@@ -607,6 +637,7 @@ async def lifespan(app: FastAPI):
         if _active_requests > 0:
             logger.warning("Shutdown: %d requests still active — proceeding", _active_requests)
     _CODE_CACHE.clear()
+    _RENDER_CACHE.clear()
     if db_pool:
         await db_pool.close()
 
@@ -623,6 +654,7 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(TraceMiddleware)
 app.add_middleware(_ActiveRequestMiddleware)
+app.add_middleware(_SecurityHeadersMiddleware)
 
 mcp = FastMCP(
     "MillerMCPDB",
@@ -884,8 +916,50 @@ async def rest_execute(request: Request):
 
 _iq_dispatcher = APIRouter(tags=["iq-apps"])
 
-# ── Render cache — GET only, opt-in via cache_ttl_seconds in router result.
-_RENDER_CACHE: Dict[str, tuple] = {}  # key → (expires_at, response)
+# ── Render cache — bounded with TTL, prevents unbounded memory growth (OOM) ──
+_RENDER_CACHE_MAX = 512
+_RENDER_CACHE_SWEEP_EVERY = 64
+_render_cache_reads: int = 0
+
+
+class _BoundedTTLCache:
+    """Dict-like cache with max size and TTL-based expiry."""
+    __slots__ = ("_data", "_maxsize")
+
+    def __init__(self, maxsize: int = 512):
+        self._data: Dict[str, tuple] = {}
+        self._maxsize = maxsize
+
+    def get(self, key: str):
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() >= entry[0]:
+            del self._data[key]
+            return None
+        return entry
+
+    def set(self, key: str, value: tuple) -> None:
+        self._data[key] = value
+        if len(self._data) > self._maxsize:
+            _oldest = next(iter(self._data))
+            del self._data[_oldest]
+
+    def sweep(self) -> int:
+        now = time.monotonic()
+        expired = [k for k, v in self._data.items() if now >= v[0]]
+        for k in expired:
+            del self._data[k]
+        return len(expired)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+_RENDER_CACHE = _BoundedTTLCache(maxsize=_RENDER_CACHE_MAX)
 
 
 async def _iq_dispatch(app_prefix: str, method: str, slug: str, request: Request) -> Response:
@@ -906,7 +980,11 @@ async def _iq_dispatch(app_prefix: str, method: str, slug: str, request: Request
             _qs = str(request.query_params)
             _cache_key = f"{app_prefix}:{slug}:{_qs}"
             _cached = _RENDER_CACHE.get(_cache_key)
-            if _cached and time.monotonic() < _cached[0]:
+            if _cached:
+                global _render_cache_reads
+                _render_cache_reads += 1
+                if _render_cache_reads % _RENDER_CACHE_SWEEP_EVERY == 0:
+                    _RENDER_CACHE.sweep()
                 return _cached[1]
 
         result = await _dispatch(tool_name, {
@@ -929,9 +1007,11 @@ async def _iq_dispatch(app_prefix: str, method: str, slug: str, request: Request
         if "redirect" in result:
             return RedirectResponse(url=str(result["redirect"]), status_code=status_code, headers=headers)
         if "html" in result:
+            if "Cache-Control" not in headers:
+                headers["Cache-Control"] = "no-store"
             _resp = HTMLResponse(content=result["html"], status_code=status_code, headers=headers)
             if _cache_key and _cache_ttl and status_code == 200:
-                _RENDER_CACHE[_cache_key] = (time.monotonic() + float(_cache_ttl), _resp)
+                _RENDER_CACHE.set(_cache_key, (time.monotonic() + float(_cache_ttl), _resp))
             return _resp
         if "js" in result:
             js_headers = {"Cache-Control": "public, max-age=300"}
@@ -972,13 +1052,13 @@ async def _iq_dispatch(app_prefix: str, method: str, slug: str, request: Request
             ".ec h1{font-size:18px;font-weight:600;color:#8a1010}"
             ".ec p{font-size:13px;color:rgba(0,0,0,0.50)}"
             "</style></head><body>"
-            f"<div class='ec'><h1>App not available</h1><p>{exc}</p></div>"
+            f"<div class='ec'><h1>App not available</h1><p>{_html.escape(str(exc))}</p></div>"
             "</body></html>"
         )
         return HTMLResponse(content=html, status_code=404)
     except Exception as exc:
         logger.exception("_iq_dispatch error app=%s slug=%s", app_prefix, slug)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 
 # Hardcoded per-app routes removed — generic /{app}/{slug} catch-all covers all IQ apps.
@@ -992,7 +1072,7 @@ async def iq_app_no_slash(app: str, request: Request):
     )
     if not exists:
         return HTMLResponse(
-            f"<!DOCTYPE html><html><body><h1>404</h1><p>No IQ app at /{app}</p></body></html>",
+            f"<!DOCTYPE html><html><body><h1>404</h1><p>No IQ app at /{_html.escape(app)}</p></body></html>",
             status_code=404,
         )
     from fastapi.responses import RedirectResponse as _RR
@@ -1006,7 +1086,7 @@ async def iq_app_root(app: str, request: Request):
     )
     if not exists:
         return HTMLResponse(
-            f"<!DOCTYPE html><html><body><h1>404</h1><p>No IQ app at /{app}/</p></body></html>",
+            f"<!DOCTYPE html><html><body><h1>404</h1><p>No IQ app at /{_html.escape(app)}/</p></body></html>",
             status_code=404,
         )
     return await _iq_dispatch(app, "GET", "", request)
@@ -1019,7 +1099,7 @@ async def iq_app_slug(app: str, slug: str, request: Request):
     )
     if not exists:
         return HTMLResponse(
-            f"<!DOCTYPE html><html><body><h1>404</h1><p>No IQ app at /{app}/{slug}</p></body></html>",
+            f"<!DOCTYPE html><html><body><h1>404</h1><p>No IQ app at /{_html.escape(app)}/{_html.escape(slug)}</p></body></html>",
             status_code=404,
         )
     return await _iq_dispatch(app, request.method, slug, request)
