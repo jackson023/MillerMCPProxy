@@ -207,6 +207,60 @@ _TOOL_GLOBALS: Dict[str, Any] = {
 
 _CODE_CACHE: Dict[str, tuple] = {}
 
+
+# ============================================================================
+# AUDIT POOL — transparent actor attribution for enterprise audit trail
+# Wraps asyncpg Pool so every tool DB write carries actor identity.
+# fn_universal_audit_trigger reads via current_setting('app.actor', true).
+# REPL-proven: set_config -> trigger capture -> reset — all green.
+# ============================================================================
+
+class _AuditPool:
+    """Wraps asyncpg Pool to auto-set/reset audit actor context on acquire."""
+    __slots__ = ('_pool', '_actor', '_actor_type', '_session_key')
+
+    def __init__(self, pool, actor: str, actor_type: str = 'ai', session_key: str = ''):
+        self._pool = pool
+        self._actor = actor
+        self._actor_type = actor_type
+        self._session_key = session_key
+
+    @asynccontextmanager
+    async def acquire(self):
+        async with self._pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    "SELECT set_config('app.actor', $1, false), "
+                    "set_config('app.actor_type', $2, false), "
+                    "set_config('app.session_key', $3, false)",
+                    self._actor, self._actor_type, self._session_key,
+                )
+                yield conn
+            finally:
+                await conn.execute(
+                    "SELECT set_config('app.actor', '', false), "
+                    "set_config('app.actor_type', '', false), "
+                    "set_config('app.session_key', '', false)"
+                )
+
+    async def fetch(self, sql, *a):
+        async with self.acquire() as c: return await c.fetch(sql, *a)
+
+    async def fetchrow(self, sql, *a):
+        async with self.acquire() as c: return await c.fetchrow(sql, *a)
+
+    async def fetchval(self, sql, *a):
+        async with self.acquire() as c: return await c.fetchval(sql, *a)
+
+    async def execute(self, sql, *a):
+        async with self.acquire() as c: return await c.execute(sql, *a)
+
+    async def executemany(self, sql, args_list):
+        async with self.acquire() as c: return await c.executemany(sql, args_list)
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
 # ============================================================================
 # _dispatch — EXECUTION ENGINE
 # ============================================================================
@@ -263,7 +317,9 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
     else:
         compiled = cache_entry[1]
 
-    scope: Dict[str, Any] = {**_TOOL_GLOBALS, "db_pool": db_pool, "args": arguments}
+    _sk = arguments.get('session_key', '') if isinstance(arguments, dict) else ''
+    _audit_pool = _AuditPool(db_pool, tool_name, 'ai', _sk)
+    scope: Dict[str, Any] = {**_TOOL_GLOBALS, "db_pool": _audit_pool, "args": arguments}
     try:
         exec(compiled, scope)
     except SyntaxError as exc:
