@@ -192,11 +192,19 @@ async def db_fetchrow(conn, sql, *vals):   return await conn.fetchrow(sql,   *co
 async def db_fetchval(conn, sql, *vals):   return await conn.fetchval(sql,   *coerce_sql_vals(sql, vals))
 async def db_executemany(conn, sql, many): return await conn.executemany(sql, [coerce_sql_vals(sql, v) for v in many])
 
+# ── Chain traceability ContextVar (S915) — parity with main server ────────────
+import contextvars
+_CHAIN_KEYS = frozenset({'_root_job_id', '_parent_job_id', '_chain_depth', '_job_id', '_origin_trace_id'})
+_chain_context: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "_chain_context", default={}
+)
+
 _TOOL_GLOBALS: Dict[str, Any] = {
     "asyncio": asyncio, "httpx": httpx, "json": json, "os": os, "logger": log,
     "coerce_args": coerce_args, "coerce_sql_vals": coerce_sql_vals,
     "db_execute": db_execute, "db_fetch": db_fetch,
     "db_fetchrow": db_fetchrow, "db_fetchval": db_fetchval, "db_executemany": db_executemany,
+    "_chain_context": _chain_context,
 }
 
 # ============================================================================
@@ -319,7 +327,11 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
 
     _sk = arguments.get('session_key', '') if isinstance(arguments, dict) else ''
     _audit_pool = _AuditPool(db_pool, tool_name, 'ai', _sk)
-    scope: Dict[str, Any] = {**_TOOL_GLOBALS, "db_pool": _audit_pool, "args": arguments}
+    scope: Dict[str, Any] = {**_TOOL_GLOBALS, "db_pool": _audit_pool, "_caller_tool": None, "args": arguments}
+
+    # S915: set chain context ContextVar for auto-inheritance
+    _chain = {k: arguments[k] for k in _CHAIN_KEYS if isinstance(arguments, dict) and arguments.get(k)} if isinstance(arguments, dict) else {}
+    _chain_token = _chain_context.set(_chain) if _chain else None
     try:
         exec(compiled, scope)
     except SyntaxError as exc:
@@ -343,7 +355,7 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
         pass
 
     t0 = time.monotonic(); status = "success"; error_type = None; result = None
-    try:
+    try:  # noqa — _chain_token reset in outer finally below
         result = await asyncio.wait_for(run_fn(arguments), timeout=_timeout_sec)
     except asyncio.TimeoutError:
         status = "error"; error_type = "TimeoutError"
@@ -351,6 +363,8 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
     except Exception as e:
         status = "error"; error_type = type(e).__name__; raise
     finally:
+        if _chain_token is not None:
+            _chain_context.reset(_chain_token)
         duration_ms = int((time.monotonic() - t0) * 1000)
         log.info(
             "Tool '%s' %s (%dms) trace=%s", tool_name, status.upper(), duration_ms, trace_id,
