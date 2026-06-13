@@ -199,12 +199,50 @@ _chain_context: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "_chain_context", default={}
 )
 
+# ── Distributed trace ContextVar (S934) — W3C traceparent propagation ────────
+_trace_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "_trace_ctx", default={}
+)
+
+
+async def _emit_span(
+    trace_id: str,
+    span_id: str,
+    parent_span_id: str | None,
+    service: str,
+    operation: str,
+    tool_name: str | None,
+    duration_ms: int,
+    status: str,
+    error_type: str | None = None,
+    error_msg: str | None = None,
+    attributes: dict | None = None,
+) -> None:
+    """S934: fire-and-forget span writer — never raises, zero latency impact."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO platform_traces "
+                "(trace_id, span_id, parent_span_id, service, operation, "
+                " tool_name, duration_ms, status, error_type, error_msg, attributes) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)",
+                trace_id, span_id, parent_span_id, service, operation,
+                tool_name, duration_ms, status, error_type, error_msg,
+                json.dumps(attributes or {}),
+            )
+    except Exception:
+        pass  # non-fatal — span emission must never crash the caller
+
+
 _TOOL_GLOBALS: Dict[str, Any] = {
     "asyncio": asyncio, "httpx": httpx, "json": json, "os": os, "logger": log,
     "coerce_args": coerce_args, "coerce_sql_vals": coerce_sql_vals,
     "db_execute": db_execute, "db_fetch": db_fetch,
     "db_fetchrow": db_fetchrow, "db_fetchval": db_fetchval, "db_executemany": db_executemany,
     "_chain_context": _chain_context,
+    "_trace_ctx":     _trace_ctx,         # S934: distributed trace ContextVar
 }
 
 # ============================================================================
@@ -405,6 +443,21 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
                 error_name=type(_metrics_exc).__name__, error_msg=str(_metrics_exc)[:500],
                 trace_id=trace_id,
             )
+        # S934: emit distributed trace span — fire-and-forget, zero latency impact
+        _tc = _trace_ctx.get()
+        if _tc.get('trace_id') and db_pool:
+            asyncio.create_task(_emit_span(
+                trace_id=_tc['trace_id'],
+                span_id=_tc.get('span_id') or os.urandom(8).hex(),
+                parent_span_id=_tc.get('parent_span_id'),
+                service='gateway',
+                operation='meta_tool',
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                status=status,
+                error_type=error_type,
+                attributes={'args_count': len(arguments) if isinstance(arguments, dict) else 0},
+            ))
 
     if isinstance(result, dict) and row.get("operational_intel"):
         _oi = row["operational_intel"]
@@ -542,7 +595,18 @@ async def meta_tool(tool_name: str, arguments: Any = None) -> Any:
         try: arguments = json.loads(arguments)
         except (json.JSONDecodeError, TypeError): arguments = {}
     if not isinstance(arguments, dict): arguments = {}
-    return await _dispatch(tool_name, arguments)
+    # S934: generate W3C traceparent at the MCP entry point — root span for this request
+    _t_trace_id = uuid.uuid4().hex           # 32 hex chars
+    _t_span_id  = os.urandom(8).hex()        # 16 hex chars
+    _t_tok = _trace_ctx.set({
+        'trace_id':       _t_trace_id,
+        'span_id':        _t_span_id,
+        'parent_span_id': None,
+    })
+    try:
+        return await _dispatch(tool_name, arguments, trace_id=_t_trace_id)
+    finally:
+        _trace_ctx.reset(_t_tok)
 
 @mcp.tool()
 def ping() -> str:
