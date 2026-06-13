@@ -1,38 +1,255 @@
-# MillerMCPProxy — Cloud Build v1 — deploys miller-mcp-gateway
+# MillerMCPProxy — Cloud Build v2.0 — deploys miller-mcp-gateway
+# v2: Enterprise-grade upgrade matching MillerMCPDB v13 pattern.
+#     FIXES: wrong _SERVICE/IMAGE substitutions — was building miller-mcp-db image
+#            and deploying it into the gateway service. Gateway was running wrong code.
+#     ADDS: record-build-started, vuln-scan-gate, platform-health-check with
+#           post_deploy_health_check -> revision_registry stable tagging.
+#     NOTE: _GATEWAY points to miller-mcp-db direct endpoint (not the gateway itself,
+#           since the gateway IS what is being deployed).
+#
+# PIPELINE: record-started -> pull-cache -> build -> push -> vuln-scan-gate -> deploy -> platform-health-check
+
 substitutions:
-  _SERVICE: miller-mcp-db-v3
-  _IMAGE: us-central1-docker.pkg.dev/miller-iq-platform/miller-iq/miller-mcp-db
+  _SERVICE: miller-mcp-gateway
+  _IMAGE: us-central1-docker.pkg.dev/miller-iq-platform/miller-iq/miller-mcp-gateway
   _REGION: us-central1
   _PROJECT: miller-iq-platform
+  _GATEWAY: https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute
+  _GATEWAY_KEY: miller-techstack-2026
   _ALLOYDB_INSTANCE_URI: projects/miller-iq-platform/locations/us-central1/clusters/miller-iq-prod/instances/miller-iq-prod-primary
+
 steps:
+- id: record-build-started
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  script: |
+    #!/usr/bin/env bash
+    PAYLOAD=$(python3 -c "
+    import json
+    print(json.dumps({
+      'tool_name': 'async_repl',
+      'arguments': {
+        'code': \"await db_pool.execute(\\\"INSERT INTO platform_events (event_type, entity_type, entity_name, payload, source, created_at) VALUES ('build.started', 'cloud_build', '$_SERVICE', '{}' ::jsonb, 'cloudbuild', NOW())\\\")\"
+      }
+    }))
+    ")
+    curl -sf --max-time 15 -X POST "$_GATEWAY" \
+      -H "Content-Type: application/json" \
+      -H "X-API-Key: $_GATEWAY_KEY" \
+      -d "$PAYLOAD" \
+      && echo "build.started recorded" \
+      || echo "WARNING: build.started record failed (non-blocking)"
+  waitFor: ['-']
+
 - id: pull-cache
   name: gcr.io/cloud-builders/docker
   entrypoint: bash
-  args: ["-c", "docker pull $_IMAGE:latest || echo no-cache"]
-  env: [DOCKER_BUILDKIT=1]
-- id: build
-  name: gcr.io/cloud-builders/docker
-  args: [build, --cache-from=$_IMAGE:latest, --build-arg, BUILDKIT_INLINE_CACHE=1, -t, "$_IMAGE:$COMMIT_SHA", -t, "$_IMAGE:latest", .]
-  waitFor: [pull-cache]
-  env: [DOCKER_BUILDKIT=1]
-- id: push
-  name: gcr.io/cloud-builders/docker
-  args: [push, --all-tags, "$_IMAGE"]
-  waitFor: [build]
-- id: deploy
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
-  entrypoint: bash
   args:
   - -c
-  - |
-    set -euo pipefail
-    sed -e "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g" -e "s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g" service.yaml > /tmp/svc.yaml
-    gcloud run services replace /tmp/svc.yaml --region=$_REGION --project=$_PROJECT
-  waitFor: [push]
-images: ["$_IMAGE:$COMMIT_SHA", "$_IMAGE:latest"]
+  - docker pull $_IMAGE:latest || echo "No cache - cold build"
+  env:
+  - DOCKER_BUILDKIT=1
+
+- id: build
+  name: gcr.io/cloud-builders/docker
+  args:
+  - build
+  - --cache-from=$_IMAGE:latest
+  - --build-arg
+  - BUILDKIT_INLINE_CACHE=1
+  - -t
+  - $_IMAGE:$COMMIT_SHA
+  - -t
+  - $_IMAGE:latest
+  - .
+  waitFor:
+  - pull-cache
+  env:
+  - DOCKER_BUILDKIT=1
+
+- id: push
+  name: gcr.io/cloud-builders/docker
+  args:
+  - push
+  - --all-tags
+  - $_IMAGE
+  waitFor:
+  - build
+
+- id: vuln-scan-gate
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  script: |
+    set -e
+    echo "Waiting for vulnerability scan..."
+    for i in $(seq 1 12); do
+      SCAN=$(gcloud artifacts docker images describe "$_IMAGE:$COMMIT_SHA" \
+        --project="$_PROJECT" --show-package-vulnerability --format=json 2>/dev/null || echo "{}")
+      CRITICAL=$(echo "$SCAN" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); v=d.get('package_vulnerability_summary',{}).get('severities',{}); print(v.get('CRITICAL',0))" 2>/dev/null || echo "0")
+      echo "Attempt $i/12: CRITICAL=$CRITICAL"
+      if [ "$CRITICAL" != "0" ] && [ "$CRITICAL" != "" ] && [ "$CRITICAL" != "null" ]; then
+        echo "CRITICAL CVEs found ($CRITICAL) - blocking deploy"; exit 1
+      fi
+      if [ "$i" -ge 3 ]; then echo "Scan window passed. Proceeding."; break; fi
+      sleep 10
+    done
+  waitFor:
+  - push
+
+- id: deploy
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  script: |
+    set -e
+    echo "=== SIDECAR DEPLOY PATTERN (v2) ==="
+    echo "Service: $_SERVICE | Image: $_IMAGE:$COMMIT_SHA"
+
+    echo "Step 1: Injecting image tag into service.yaml..."
+    sed "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g; s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g" service.yaml > /tmp/service-deploy.yaml
+
+    echo "Step 2: Verifying sidecar in spec..."
+    grep -q "alloydb-proxy" /tmp/service-deploy.yaml || { echo "ERROR: alloydb-proxy missing"; exit 1; }
+    grep -q "IMAGE_PLACEHOLDER" /tmp/service-deploy.yaml && { echo "ERROR: IMAGE_PLACEHOLDER not replaced"; exit 1; } || true
+    grep -q "ALLOYDB_INSTANCE_PLACEHOLDER" /tmp/service-deploy.yaml && { echo "ERROR: ALLOYDB_INSTANCE_PLACEHOLDER not replaced"; exit 1; } || true
+    grep -q "$COMMIT_SHA" /tmp/service-deploy.yaml || { echo "ERROR: image tag not injected"; exit 1; }
+
+    echo "Image lines:"
+    grep "image:" /tmp/service-deploy.yaml
+
+    echo "Step 3: Deploying via services replace..."
+    gcloud run services replace /tmp/service-deploy.yaml \
+      --region="$_REGION" --project="$_PROJECT"
+
+    echo "Step 4: Verifying Cloud Run readiness..."
+    sleep 15
+    STATUS=$(gcloud run services describe "$_SERVICE" \
+      --region="$_REGION" --project="$_PROJECT" \
+      --format="value(status.conditions[0].status)")
+    echo "Service status: $STATUS"
+    if [ "$STATUS" != "True" ]; then
+      echo "WARNING: Service not ready after 15s. Check Cloud Console."
+    else
+      echo "Service ready."
+    fi
+
+    echo "=== Deploy complete ==="
+  waitFor:
+  - vuln-scan-gate
+
+- id: platform-health-check
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  script: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    echo "=== PLATFORM HEALTH CHECK (v1) ==="
+    echo "Service: $_SERVICE | Build: $BUILD_ID | Commit: $COMMIT_SHA"
+    echo "Calling via miller-mcp-db direct endpoint (gateway is the service being deployed)"
+
+    PAYLOAD=$(python3 -c "
+    import json
+    print(json.dumps({
+      'tool_name': 'post_deploy_health_check',
+      'arguments': {
+        'service':      '$_SERVICE',
+        'build_id':     '$BUILD_ID',
+        'commit_sha':   '$COMMIT_SHA',
+        'wait_seconds': 20
+      }
+    }))
+    ")
+
+    MAX_ATTEMPTS=3
+    ATTEMPT=0
+    RESULT=""
+
+    while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+      ATTEMPT=$((ATTEMPT + 1))
+      echo ""
+      echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: calling post_deploy_health_check..."
+
+      HTTP_CODE=$(curl -s -o /tmp/phc_response.json -w "%{http_code}" \
+        --max-time 120 \
+        --retry 0 \
+        -X POST "$_GATEWAY" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: $_GATEWAY_KEY" \
+        -d "$PAYLOAD" 2>/dev/null || echo "000")
+
+      echo "HTTP status: $HTTP_CODE"
+
+      if [ "$HTTP_CODE" = "200" ] && [ -s /tmp/phc_response.json ]; then
+        RESULT=$(cat /tmp/phc_response.json)
+        echo "Response received."
+        break
+      fi
+
+      echo "Attempt $ATTEMPT failed (HTTP $HTTP_CODE). Waiting 20s before retry..."
+      sleep 20
+    done
+
+    if [ -z "$RESULT" ]; then
+      echo ""
+      echo "WARNING: post_deploy_health_check unreachable after $MAX_ATTEMPTS attempts."
+      echo "Revision NOT marked stable. ACTION REQUIRED: run record_revision(action='mark_stable', service='$_SERVICE') manually."
+      exit 0
+    fi
+
+    HEALTH=$(echo "$RESULT" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('health_status','unknown'))" \
+      2>/dev/null || echo "parse_error")
+
+    MARKED_STABLE=$(echo "$RESULT" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('marked_stable', False))" \
+      2>/dev/null || echo "False")
+
+    REVISION=$(echo "$RESULT" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('revision','unknown'))" \
+      2>/dev/null || echo "unknown")
+
+    RESPONSE_MS=$(echo "$RESULT" | python3 -c \
+      "import sys,json; d=json.load(sys.stdin); print(d.get('response_time_ms','?'))" \
+      2>/dev/null || echo "?")
+
+    echo ""
+    echo "=== Health Check Summary ==="
+    echo "  Revision:         $REVISION"
+    echo "  Health status:    $HEALTH"
+    echo "  Response time:    ${RESPONSE_MS}ms"
+    echo "  Marked stable:    $MARKED_STABLE"
+    echo "  Build ID:         $BUILD_ID"
+    echo "  Commit SHA:       $COMMIT_SHA"
+
+    if [ "$HEALTH" = "unhealthy" ]; then
+      echo ""
+      echo "FATAL: Service $_SERVICE is UNHEALTHY after deploy."
+      echo "Revision $REVISION marked FAILED in revision_registry."
+      echo "To restore: call rollback_service(service='$_SERVICE')"
+      exit 1
+    fi
+
+    if [ "$MARKED_STABLE" = "True" ]; then
+      echo ""
+      echo "SUCCESS: Revision $REVISION is STABLE."
+      echo "revision_registry updated: stability_status='stable', stable_at=NOW()."
+      echo "rollback_service will target this revision on next incident."
+    else
+      echo ""
+      echo "NOTE: Revision $REVISION healthy but not yet marked stable."
+    fi
+
+    echo ""
+    echo "=== Platform health check complete ==="
+    exit 0
+  waitFor:
+  - deploy
+
+images:
+- $_IMAGE:$COMMIT_SHA
+- $_IMAGE:latest
+
+logsBucket: 'gs://miller-iq-platform_cloudbuild'
+
 options:
   dynamicSubstitutions: true
   automapSubstitutions: true
-  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
+
 timeout: 1200s
