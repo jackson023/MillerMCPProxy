@@ -343,7 +343,7 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT code, input_schema, operational_intel, version, tool_status "
+            "SELECT code, input_schema, output_schema, operational_intel, version, tool_status "
             "FROM tool_registry WHERE name = $1 AND enabled = TRUE",
             tool_name,
         )
@@ -400,6 +400,8 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
     t0 = time.monotonic(); status = "success"; error_type = None; result = None
     try:  # noqa — _chain_token reset in outer finally below
         result = await asyncio.wait_for(run_fn(arguments), timeout=_timeout_sec)
+        # S935: output contract validation — fire-and-forget, never blocks
+        asyncio.create_task(_assert_output(result, row.get('output_schema'), tool_name, trace_id))
     except asyncio.TimeoutError:
         status = "error"; error_type = "TimeoutError"
         raise RuntimeError(f"Tool '{tool_name}' timed out after {_timeout_sec}s.")
@@ -501,6 +503,79 @@ async def _write_error_bus(
         )
     except Exception:
         pass  # truly non-fatal — never let the error bus crash the caller
+
+
+async def _write_assertion(
+    assertion_type: str,
+    target: str | None,
+    status: str,
+    expected: dict | None = None,
+    actual: dict | None = None,
+    message: str | None = None,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+    tool_name_ctx: str | None = None,
+) -> None:
+    """S935: fire-and-forget assertion writer for gateway. Mirrors main.py. Never raises."""
+    if not db_pool:
+        return
+    try:
+        await db_pool.execute(
+            "INSERT INTO platform_assertions "
+            "(trace_id, span_id, tool_name, assertion_type, target, status, expected, actual, message) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)",
+            trace_id or None,
+            span_id or None,
+            (tool_name_ctx or '')[:200],
+            assertion_type[:100],
+            (target or '')[:200],
+            status[:20],
+            json.dumps(expected) if expected is not None else None,
+            json.dumps(actual) if actual is not None else None,
+            (message or '')[:500],
+        )
+    except Exception:
+        pass
+
+
+async def _assert_output(
+    result: Any,
+    schema,
+    tool_name: str,
+    trace_id: str | None,
+    span_id: str | None = None,
+) -> None:
+    """S935: fire-and-forget output contract validator for gateway. Never raises."""
+    try:
+        if result is None:
+            await _write_assertion(
+                'output_contract', tool_name, 'fail',
+                expected={'type': 'dict'},
+                actual={'type': 'null'},
+                message='Tool returned None',
+                trace_id=trace_id, span_id=span_id,
+                tool_name_ctx=tool_name,
+            )
+            return
+        if schema:
+            raw = schema if isinstance(schema, dict) else json.loads(schema)
+            required = raw.get('required', [])
+            for key in required:
+                if not isinstance(result, dict) or key not in result:
+                    await _write_assertion(
+                        'output_contract', tool_name, 'fail',
+                        expected={'key': key, 'present': True},
+                        actual={'key': key, 'present': False},
+                        message=f'Required output key missing: {key}',
+                        trace_id=trace_id, span_id=span_id,
+                        tool_name_ctx=tool_name,
+                    )
+    except Exception:
+        pass
+
+
+_TOOL_GLOBALS["_write_assertion"] = _write_assertion
+
 
 # ============================================================================
 # MIDDLEWARE
