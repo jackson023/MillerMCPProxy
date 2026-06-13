@@ -297,6 +297,11 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
             raise
         except Exception as _rl_exc:
             log.warning("Rate limit check failed (non-fatal): %s", _rl_exc)
+            await _write_error_bus(
+                'mcp_rate_limit_check_failed', tool_name=tool_name,
+                error_name=type(_rl_exc).__name__, error_msg=str(_rl_exc)[:500],
+                trace_id=trace_id,
+            )
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -361,7 +366,20 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
         status = "error"; error_type = "TimeoutError"
         raise RuntimeError(f"Tool '{tool_name}' timed out after {_timeout_sec}s.")
     except Exception as e:
-        status = "error"; error_type = type(e).__name__; raise
+        status = "error"; error_type = type(e).__name__
+        import traceback as _tb
+        _tb_job_id = arguments.get('_job_id') if isinstance(arguments, dict) else None
+        await _write_error_bus(
+            'mcp_dispatch',
+            tool_name=tool_name,
+            job_id=_tb_job_id or '',
+            error_name=type(e).__name__,
+            error_msg=str(e)[:500],
+            stack_trace=_tb.format_exc()[:5000],
+            trace_id=trace_id,
+            context={'version': version, 'has_job_id': bool(_tb_job_id)},
+        )
+        raise
     finally:
         if _chain_token is not None:
             _chain_context.reset(_chain_token)
@@ -380,8 +398,13 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
                     json.dumps({"args_count": len(arguments) if isinstance(arguments, dict) else 0}),
                     trace_id,
                 )
-        except Exception:
+        except Exception as _metrics_exc:
             log.exception("Failed to log metrics for tool: %s", tool_name)
+            await _write_error_bus(
+                'mcp_dispatch_metrics_failed', tool_name=tool_name,
+                error_name=type(_metrics_exc).__name__, error_msg=str(_metrics_exc)[:500],
+                trace_id=trace_id,
+            )
 
     if isinstance(result, dict) and row.get("operational_intel"):
         _oi = row["operational_intel"]
@@ -389,6 +412,42 @@ async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | N
     return result
 
 _TOOL_GLOBALS["_dispatch"] = _dispatch
+
+
+async def _write_error_bus(
+    source: str,
+    tool_name: str | None = None,
+    job_id: str | None = None,
+    error_name: str | None = None,
+    error_msg: str | None = None,
+    stack_trace: str | None = None,
+    context: dict | None = None,
+    trace_id: str | None = None,
+) -> None:
+    """
+    S932: Error bus write for MCP gateway _dispatch. Mirrors main.py _write_error_bus.
+    Uses db_pool.execute() — asyncpg Pool convenience method, safe in except blocks.
+    Never raises — error bus must never crash the caller.
+    source prefix 'mcp_' distinguishes gateway errors from DB-service errors.
+    """
+    if not db_pool:
+        return
+    try:
+        await db_pool.execute(
+            "INSERT INTO platform_error_bus "
+            "(source, tool_name, job_id, error_name, error_msg, stack_trace, context, trace_id) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)",
+            source,
+            (tool_name or '')[:200],
+            (job_id or '')[:200],
+            (error_name or '')[:200],
+            (error_msg or '')[:500],
+            (stack_trace or '')[:5000],
+            json.dumps(context or {}),
+            trace_id or None,
+        )
+    except Exception:
+        pass  # truly non-fatal — never let the error bus crash the caller
 
 # ============================================================================
 # MIDDLEWARE
