@@ -16,7 +16,7 @@ substitutions:
   _PROJECT: miller-iq-platform
   _GATEWAY: https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute
   _GATEWAY_KEY: miller-techstack-2026
-  _ALLOYDB_INSTANCE_URI: projects/miller-iq-platform/locations/us-central1/clusters/miller-iq-prod/instances/miller-iq-prod-primary
+  _ALLOYDB_INSTANCE_URI: projects/miller-iq-platform/locations/us-central1/clusters/miller-iq-prod-restored/instances/miller-iq-prod-primary
 
 steps:
 - id: record-build-started
