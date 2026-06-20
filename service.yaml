@@ -21,7 +21,7 @@ spec:
     metadata:
       annotations:
         autoscaling.knative.dev/maxScale: '10'
-        autoscaling.knative.dev/minScale: '1'
+        autoscaling.knative.dev/minScale: '0'
         run.googleapis.com/container-dependencies: '{"app":["alloydb-proxy"]}'
         run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
         run.googleapis.com/startup-cpu-boost: 'true'
@@ -38,8 +38,8 @@ spec:
           name: http1
         resources:
           limits:
-            cpu: 1000m
-            memory: 512Mi
+            cpu: 500m
+            memory: 256Mi
         env:
         - name: TOOL_RELOAD_TS
           value: '20260505-1520'
