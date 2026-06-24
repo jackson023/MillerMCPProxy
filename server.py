@@ -1,17 +1,22 @@
 """
-Miller IQ Platform — MCP Gateway v4 (Enterprise Edition)
-Responsibilities: MCP tool execution ONLY.
-  - Claude → meta_tool → _dispatch → AlloyDB → result
-  - No IQ app HTTP routes (those belong in miller-mcp-db-v3)
+Miller IQ Platform — MCP Gateway v5 (S1038 Forward + Repair Edition)
 
-Enterprise additions v4:
-  - FastAPI wrapper: proper /health HTTP endpoint, CORS, GZip
-  - TraceMiddleware: X-Trace-Id on every request → cloud_ops_metrics
-  - Structured JSON logging: queryable fields in Cloud Logging
-  - Compiled code cache: compile() once per tool version, cache in-process
-  - Tool access guard: internal tools blocked at MCP layer
-  - Graceful shutdown: drain in-flight requests before pool close
-  - Active request tracking: prevents mid-execution SIGTERM kills
+Execution strategy:
+  Normal path: forward every tool call to miller-mcp-db-v3 /execute via OIDC.
+    Auto-parity: main.py owns ALL execution logic. No divergence possible.
+  Repair path: if mcpdb returns 502/503/connect error/timeout, fall back to
+    local execution ONLY for tools tagged tool_status='repair' in tool_registry.
+    This preserves MCP access during main.py outages for diagnostics + recovery.
+
+Why OIDC forward instead of copying _dispatch:
+  Copying _dispatch creates two diverging engines that require manual sync.
+  Forwarding via OIDC means every main.py improvement (S1037 error snippets,
+  learning hooks, genie_id extraction, SmartPool) applies to MCP calls instantly.
+
+Responsibilities: MCP protocol adapter + repair fallback only.
+  - Claude -> meta_tool -> _dispatch -> mcpdb /execute -> result  (normal)
+  - Claude -> meta_tool -> _dispatch -> local exec (repair tools only)  (fallback)
+  - No IQ app HTTP routes (those belong in miller-mcp-db-v3)
 """
 
 import asyncio
@@ -24,6 +29,7 @@ import datetime as _iq_dt
 import sys
 import time
 import uuid
+import contextvars
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
@@ -39,8 +45,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 # ============================================================================
 # STRUCTURED JSON LOGGER
-# Every log line is valid JSON — queryable by field in Cloud Logging.
-# Fields: severity, message, logger, time, trace_id, tool_name, duration_ms
 # ============================================================================
 
 class _JSONFormatter(logging.Formatter):
@@ -52,7 +56,7 @@ class _JSONFormatter(logging.Formatter):
             "time":     _iq_dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.") +
                         f"{int(record.msecs):03d}Z",
         }
-        for field in ("trace_id", "tool_name", "duration_ms", "tool_count"):
+        for field in ("trace_id", "tool_name", "duration_ms", "tool_count", "mcpdb_status"):
             if hasattr(record, field):
                 obj[field] = getattr(record, field)
         if record.exc_info:
@@ -94,8 +98,10 @@ log.info("Loaded %d secrets from %s", _n, SECRETS_DIR)
 # DATABASE
 # ============================================================================
 
+_DSN_PREFIXES = ("postgresql+psycopg2://", "postgresql+asyncpg://", "postgres+asyncpg://")
+
 def _normalize_dsn(dsn: str) -> str:
-    for prefix in ("postgresql+psycopg2://", "postgresql+asyncpg://", "postgres+asyncpg://"):
+    for prefix in _DSN_PREFIXES:
         if dsn.startswith(prefix):
             return "postgresql://" + dsn[len(prefix):]
     return dsn
@@ -183,7 +189,7 @@ def coerce_sql_vals(sql, vals):
         cast = m.group(2).lower()
         if 0 <= pos < len(out) and cast in _IQ_CAST_FN:
             try: out[pos] = _IQ_CAST_FN[cast](out[pos])
-            except: pass
+            except Exception: pass
     return out
 
 async def db_execute(conn, sql, *vals):    return await conn.execute(sql,    *coerce_sql_vals(sql, vals))
@@ -192,33 +198,34 @@ async def db_fetchrow(conn, sql, *vals):   return await conn.fetchrow(sql,   *co
 async def db_fetchval(conn, sql, *vals):   return await conn.fetchval(sql,   *coerce_sql_vals(sql, vals))
 async def db_executemany(conn, sql, many): return await conn.executemany(sql, [coerce_sql_vals(sql, v) for v in many])
 
-# ── Chain traceability ContextVar (S915) — parity with main server ────────────
-import contextvars
+# ============================================================================
+# CONTEXTVARS
+# ============================================================================
+
 _CHAIN_KEYS = frozenset({'_root_job_id', '_parent_job_id', '_chain_depth', '_job_id', '_origin_trace_id'})
-_chain_context: contextvars.ContextVar[dict] = contextvars.ContextVar(
-    "_chain_context", default={}
-)
+_chain_context: contextvars.ContextVar[dict] = contextvars.ContextVar("_chain_context", default={})
+_trace_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("_trace_ctx", default={})
+_request_meta: contextvars.ContextVar[dict] = contextvars.ContextVar("_request_meta", default={})
+_current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_tool", default=None)
 
-# ── Distributed trace ContextVar (S934) — W3C traceparent propagation ────────
-_trace_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
-    "_trace_ctx", default={}
-)
 
+class JobPaused(Exception):
+    def __init__(self, job_id, status, checkpoint=None):
+        self.job_id = job_id; self.status = status; self.checkpoint = checkpoint
+        super().__init__(f"Job {job_id} {status}")
+
+
+# ============================================================================
+# SPAN TELEMETRY
+# ============================================================================
 
 async def _emit_span(
-    trace_id: str,
-    span_id: str,
-    parent_span_id: str | None,
-    service: str,
-    operation: str,
-    tool_name: str | None,
-    duration_ms: int,
-    status: str,
-    error_type: str | None = None,
-    error_msg: str | None = None,
+    trace_id: str, span_id: str, parent_span_id: str | None,
+    service: str, operation: str, tool_name: str | None,
+    duration_ms: int, status: str,
+    error_type: str | None = None, error_msg: str | None = None,
     attributes: dict | None = None,
 ) -> None:
-    """S934: fire-and-forget span writer — never raises, zero latency impact."""
     if not db_pool:
         return
     try:
@@ -233,240 +240,59 @@ async def _emit_span(
                 json.dumps(attributes or {}),
             )
     except Exception:
-        pass  # non-fatal — span emission must never crash the caller
-
-
-_TOOL_GLOBALS: Dict[str, Any] = {
-    "asyncio": asyncio, "httpx": httpx, "json": json, "os": os, "logger": log,
-    "coerce_args": coerce_args, "coerce_sql_vals": coerce_sql_vals,
-    "db_execute": db_execute, "db_fetch": db_fetch,
-    "db_fetchrow": db_fetchrow, "db_fetchval": db_fetchval, "db_executemany": db_executemany,
-    "_chain_context": _chain_context,
-    "_trace_ctx":     _trace_ctx,         # S934: distributed trace ContextVar
-}
-
-# ============================================================================
-# COMPILED CODE CACHE
-# tool_name -> (version, compiled). Evicts on version bump.
-# Bounded by distinct tool count, not version history.
-# ============================================================================
-
-_CODE_CACHE: Dict[str, tuple] = {}
-
-
-# ============================================================================
-# AUDIT POOL — transparent actor attribution for enterprise audit trail
-# Wraps asyncpg Pool so every tool DB write carries actor identity.
-# fn_universal_audit_trigger reads via current_setting('app.actor', true).
-# REPL-proven: set_config -> trigger capture -> reset — all green.
-# ============================================================================
-
-class _AuditPool:
-    """Wraps asyncpg Pool to auto-set/reset audit actor context on acquire."""
-    __slots__ = ('_pool', '_actor', '_actor_type', '_session_key')
-
-    def __init__(self, pool, actor: str, actor_type: str = 'ai', session_key: str = ''):
-        self._pool = pool
-        self._actor = actor
-        self._actor_type = actor_type
-        self._session_key = session_key
-
-    @asynccontextmanager
-    async def acquire(self):
-        async with self._pool.acquire() as conn:
-            try:
-                await conn.execute(
-                    "SELECT set_config('app.actor', $1, false), "
-                    "set_config('app.actor_type', $2, false), "
-                    "set_config('app.session_key', $3, false)",
-                    self._actor, self._actor_type, self._session_key,
-                )
-                yield conn
-            finally:
-                await conn.execute(
-                    "SELECT set_config('app.actor', '', false), "
-                    "set_config('app.actor_type', '', false), "
-                    "set_config('app.session_key', '', false)"
-                )
-
-    async def fetch(self, sql, *a):
-        async with self.acquire() as c: return await c.fetch(sql, *a)
-
-    async def fetchrow(self, sql, *a):
-        async with self.acquire() as c: return await c.fetchrow(sql, *a)
-
-    async def fetchval(self, sql, *a):
-        async with self.acquire() as c: return await c.fetchval(sql, *a)
-
-    async def execute(self, sql, *a):
-        async with self.acquire() as c: return await c.execute(sql, *a)
-
-    async def executemany(self, sql, args_list):
-        async with self.acquire() as c: return await c.executemany(sql, args_list)
-
-    def __getattr__(self, name):
-        return getattr(self._pool, name)
-
-# ============================================================================
-# _dispatch — EXECUTION ENGINE
-# ============================================================================
-
-async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | None = None) -> Any:
-    if trace_id is None:
-        trace_id = str(uuid.uuid4())
-
-    _RATE_LIMIT_EXEMPT = frozenset({
-        "rate_limiter", "db_health_check", "smoke_test_hello_world",
-        "regression_runner", "pool_health_monitor", "trace_explorer",
-        "schema_migration_manager", "build_session_context", "check_context_health",
-    })
-    if tool_name not in _RATE_LIMIT_EXEMPT:
-        try:
-            rl_row = await db_pool.fetchval(
-                "SELECT code FROM tool_registry WHERE name='rate_limiter' AND enabled=TRUE"
-            )
-            if rl_row:
-                _rl_scope = {"asyncpg": asyncpg, "os": os, "json": json, "db_pool": db_pool}
-                exec(compile(rl_row, '<rate_limiter>', 'exec'), _rl_scope)
-                rl_result = await _rl_scope['run']({'action': 'check', 'tool_name': tool_name})
-                if rl_result.get('allowed') is False:
-                    raise RuntimeError(f"Rate limited: {rl_result.get('reason', 'limit exceeded')}")
-        except RuntimeError:
-            raise
-        except Exception as _rl_exc:
-            log.warning("Rate limit check failed (non-fatal): %s", _rl_exc)
-            await _write_error_bus(
-                'mcp_rate_limit_check_failed', tool_name=tool_name,
-                error_name=type(_rl_exc).__name__, error_msg=str(_rl_exc)[:500],
-                trace_id=trace_id,
-            )
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT code, input_schema, output_schema, operational_intel, version, tool_status "
-            "FROM tool_registry WHERE name = $1 AND enabled = TRUE",
-            tool_name,
-        )
-    if row is None:
-        async with db_pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE")
-        raise ValueError(
-            f"Tool '{tool_name}' not found in the registry "
-            f"({count} tools loaded). Check the tool name and try again."
-        )
-
-    code = row["code"]; schema = row["input_schema"]; version = row["version"]
-    arguments = coerce_args(arguments, schema)
-
-    cache_entry = _CODE_CACHE.get(tool_name)
-    if cache_entry is None or cache_entry[0] != version:
-        try:
-            compiled = compile(code, f"<tool:{tool_name}>", "exec")
-            _CODE_CACHE[tool_name] = (version, compiled)
-        except SyntaxError as exc:
-            raise RuntimeError(f"Tool '{tool_name}' has a syntax error: {exc}") from exc
-    else:
-        compiled = cache_entry[1]
-
-    _sk = arguments.get('session_key', '') if isinstance(arguments, dict) else ''
-    _audit_pool = _AuditPool(db_pool, tool_name, 'ai', _sk)
-    scope: Dict[str, Any] = {**_TOOL_GLOBALS, "db_pool": _audit_pool, "_caller_tool": None, "args": arguments}
-
-    # S915: set chain context ContextVar for auto-inheritance
-    _chain = {k: arguments[k] for k in _CHAIN_KEYS if isinstance(arguments, dict) and arguments.get(k)} if isinstance(arguments, dict) else {}
-    _chain_token = _chain_context.set(_chain) if _chain else None
-    try:
-        exec(compiled, scope)
-    except SyntaxError as exc:
-        raise RuntimeError(f"Tool '{tool_name}' has a syntax error: {exc}") from exc
-
-    run_fn = scope.get("run")
-    if run_fn is None:
-        raise RuntimeError(f"Tool '{tool_name}' must define `async def run(args: dict) -> ...:`")
-    if not inspect.iscoroutinefunction(run_fn):
-        raise RuntimeError(f"Tool '{tool_name}': `run` must be async.")
-
-    _timeout_sec = TOOL_TIMEOUT
-    try:
-        async with db_pool.acquire() as conn:
-            _t = await conn.fetchval(
-                "SELECT timeout_seconds FROM execution_timeout_config WHERE tool_name = $1",
-                tool_name,
-            )
-        if _t is not None: _timeout_sec = _t
-    except Exception:
         pass
 
-    t0 = time.monotonic(); status = "success"; error_type = None; result = None
-    try:  # noqa — _chain_token reset in outer finally below
-        result = await asyncio.wait_for(run_fn(arguments), timeout=_timeout_sec)
-        # S935: output contract validation — fire-and-forget, never blocks
-        asyncio.create_task(_assert_output(result, row.get('output_schema'), tool_name, trace_id))
-    except asyncio.TimeoutError:
-        status = "error"; error_type = "TimeoutError"
-        raise RuntimeError(f"Tool '{tool_name}' timed out after {_timeout_sec}s.")
-    except Exception as e:
-        status = "error"; error_type = type(e).__name__
-        import traceback as _tb
-        _tb_job_id = arguments.get('_job_id') if isinstance(arguments, dict) else None
-        await _write_error_bus(
-            'mcp_dispatch',
-            tool_name=tool_name,
-            job_id=_tb_job_id or '',
-            error_name=type(e).__name__,
-            error_msg=str(e)[:500],
-            stack_trace=_tb.format_exc()[:5000],
-            trace_id=trace_id,
-            context={'version': version, 'has_job_id': bool(_tb_job_id)},
-        )
-        raise
-    finally:
-        if _chain_token is not None:
-            _chain_context.reset(_chain_token)
-        duration_ms = int((time.monotonic() - t0) * 1000)
-        log.info(
-            "Tool '%s' %s (%dms) trace=%s", tool_name, status.upper(), duration_ms, trace_id,
-            extra={"trace_id": trace_id, "tool_name": tool_name, "duration_ms": duration_ms},
-        )
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO cloud_ops_metrics "
-                    "(metric_type, tool_name, duration_ms, status, error_type, metadata, trace_id) "
-                    "VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)",
-                    "tool_execution", tool_name, duration_ms, status, error_type,
-                    json.dumps({"args_count": len(arguments) if isinstance(arguments, dict) else 0}),
-                    trace_id,
-                )
-        except Exception as _metrics_exc:
-            log.exception("Failed to log metrics for tool: %s", tool_name)
-            await _write_error_bus(
-                'mcp_dispatch_metrics_failed', tool_name=tool_name,
-                error_name=type(_metrics_exc).__name__, error_msg=str(_metrics_exc)[:500],
-                trace_id=trace_id,
+
+# ============================================================================
+# ERROR BUS + S1037 CODE SNIPPETS
+# ============================================================================
+
+async def _attach_error_snippet(
+    err_id: int, tool_name: str,
+    error_name: str | None, stack_trace: str | None,
+) -> None:
+    """S1037: Attach source context lines to error bus row. Fire-and-forget."""
+    if not db_pool:
+        return
+    try:
+        import re as _re
+        async with db_pool.acquire() as _conn:
+            _row = await _conn.fetchrow(
+                "SELECT code FROM tool_registry WHERE name = $1 AND enabled = TRUE LIMIT 1",
+                tool_name,
             )
-        # S934: emit distributed trace span — fire-and-forget, zero latency impact
-        _tc = _trace_ctx.get()
-        if _tc.get('trace_id') and db_pool:
-            asyncio.create_task(_emit_span(
-                trace_id=_tc['trace_id'],
-                span_id=_tc.get('span_id') or os.urandom(8).hex(),
-                parent_span_id=_tc.get('parent_span_id'),
-                service='gateway',
-                operation='meta_tool',
-                tool_name=tool_name,
-                duration_ms=duration_ms,
-                status=status,
-                error_type=error_type,
-                attributes={'args_count': len(arguments) if isinstance(arguments, dict) else 0},
-            ))
-
-    if isinstance(result, dict) and row.get("operational_intel"):
-        _oi = row["operational_intel"]
-        result["_intel"] = json.loads(_oi) if isinstance(_oi, str) else _oi
-    return result
-
-_TOOL_GLOBALS["_dispatch"] = _dispatch
+        if not _row or not _row['code']:
+            return
+        _lines = _row['code'].splitlines()
+        _line_num = None
+        if stack_trace:
+            _m = _re.search(r'File "<tool:[^>]+>", line (\d+)', stack_trace)
+            if _m:
+                _line_num = int(_m.group(1))
+        if _line_num:
+            _start = max(0, _line_num - 4)
+            _end   = min(len(_lines), _line_num + 3)
+        else:
+            _start, _end = 0, min(30, len(_lines))
+            if error_name:
+                for _i, _ln in enumerate(_lines):
+                    if error_name in _ln:
+                        _start = max(0, _i - 3)
+                        _end   = min(len(_lines), _i + 5)
+                        break
+        _snippet = '\n'.join(
+            '{}{:4d}  {}'.format(
+                '->' if _line_num and (i + 1 == _line_num) else '  ',
+                i + 1, _lines[i],
+            )
+            for i in range(_start, _end)
+        )[:3000]
+        await db_pool.execute(
+            "UPDATE platform_error_bus SET code_snippet = $1 WHERE id = $2",
+            _snippet, err_id,
+        )
+    except Exception:
+        pass
 
 
 async def _write_error_bus(
@@ -479,19 +305,14 @@ async def _write_error_bus(
     context: dict | None = None,
     trace_id: str | None = None,
 ) -> None:
-    """
-    S932: Error bus write for MCP gateway _dispatch. Mirrors main.py _write_error_bus.
-    Uses db_pool.execute() — asyncpg Pool convenience method, safe in except blocks.
-    Never raises — error bus must never crash the caller.
-    source prefix 'mcp_' distinguishes gateway errors from DB-service errors.
-    """
+    """S932+S1037: Error capture with RETURNING id -> _attach_error_snippet. Never raises."""
     if not db_pool:
         return
     try:
-        await db_pool.execute(
+        _err_id = await db_pool.fetchval(
             "INSERT INTO platform_error_bus "
             "(source, tool_name, job_id, error_name, error_msg, stack_trace, context, trace_id) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8) RETURNING id",
             source,
             (tool_name or '')[:200],
             (job_id or '')[:200],
@@ -501,22 +322,18 @@ async def _write_error_bus(
             json.dumps(context or {}),
             trace_id or None,
         )
+        if _err_id and tool_name:
+            asyncio.create_task(_attach_error_snippet(_err_id, tool_name, error_name, stack_trace))
     except Exception:
-        pass  # truly non-fatal — never let the error bus crash the caller
+        pass
 
 
 async def _write_assertion(
-    assertion_type: str,
-    target: str | None,
-    status: str,
-    expected: dict | None = None,
-    actual: dict | None = None,
-    message: str | None = None,
-    trace_id: str | None = None,
-    span_id: str | None = None,
-    tool_name_ctx: str | None = None,
+    assertion_type: str, target: str | None, status: str,
+    expected: dict | None = None, actual: dict | None = None,
+    message: str | None = None, trace_id: str | None = None,
+    span_id: str | None = None, tool_name_ctx: str | None = None,
 ) -> None:
-    """S935: fire-and-forget assertion writer for gateway. Mirrors main.py. Never raises."""
     if not db_pool:
         return
     try:
@@ -524,12 +341,8 @@ async def _write_assertion(
             "INSERT INTO platform_assertions "
             "(trace_id, span_id, tool_name, assertion_type, target, status, expected, actual, message) "
             "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)",
-            trace_id or None,
-            span_id or None,
-            (tool_name_ctx or '')[:200],
-            assertion_type[:100],
-            (target or '')[:200],
-            status[:20],
+            trace_id or None, span_id or None, (tool_name_ctx or '')[:200],
+            assertion_type[:100], (target or '')[:200], status[:20],
             json.dumps(expected) if expected is not None else None,
             json.dumps(actual) if actual is not None else None,
             (message or '')[:500],
@@ -538,43 +351,317 @@ async def _write_assertion(
         pass
 
 
-async def _assert_output(
-    result: Any,
-    schema,
-    tool_name: str,
-    trace_id: str | None,
-    span_id: str | None = None,
-) -> None:
-    """S935: fire-and-forget output contract validator for gateway. Never raises."""
+async def _assert_output(result, schema, tool_name, trace_id, span_id=None):
     try:
         if result is None:
-            await _write_assertion(
-                'output_contract', tool_name, 'fail',
-                expected={'type': 'dict'},
-                actual={'type': 'null'},
-                message='Tool returned None',
-                trace_id=trace_id, span_id=span_id,
-                tool_name_ctx=tool_name,
-            )
+            await _write_assertion('output_contract', tool_name, 'fail',
+                expected={'type': 'dict'}, actual={'type': 'null'},
+                message='Tool returned None', trace_id=trace_id,
+                span_id=span_id, tool_name_ctx=tool_name)
             return
         if schema:
             raw = schema if isinstance(schema, dict) else json.loads(schema)
-            required = raw.get('required', [])
-            for key in required:
+            for key in raw.get('required', []):
                 if not isinstance(result, dict) or key not in result:
-                    await _write_assertion(
-                        'output_contract', tool_name, 'fail',
+                    await _write_assertion('output_contract', tool_name, 'fail',
                         expected={'key': key, 'present': True},
                         actual={'key': key, 'present': False},
                         message=f'Required output key missing: {key}',
-                        trace_id=trace_id, span_id=span_id,
-                        tool_name_ctx=tool_name,
-                    )
+                        trace_id=trace_id, span_id=span_id, tool_name_ctx=tool_name)
     except Exception:
         pass
 
 
-_TOOL_GLOBALS["_write_assertion"] = _write_assertion
+# ============================================================================
+# AUDIT POOL
+# ============================================================================
+
+class _AuditPool:
+    __slots__ = ('_pool', '_actor', '_actor_type', '_session_key', '_job_id')
+
+    def __init__(self, pool, actor: str, actor_type: str = 'ai',
+                 session_key: str = '', job_id: str = ''):
+        self._pool = pool; self._actor = actor; self._actor_type = actor_type
+        self._session_key = session_key; self._job_id = job_id
+
+    @asynccontextmanager
+    async def acquire(self):
+        async with self._pool.acquire() as conn:
+            try:
+                try:
+                    await conn.execute(
+                        "SELECT set_config('app.actor', $1, false), "
+                        "set_config('app.actor_type', $2, false), "
+                        "set_config('app.session_key', $3, false)",
+                        self._actor, self._actor_type, self._session_key,
+                    )
+                    if self._job_id:
+                        await conn.execute(f"SET application_name = 'miller:job:{self._job_id}'")
+                except Exception:
+                    pass
+                yield conn
+            finally:
+                try:
+                    await conn.execute(
+                        "SELECT set_config('app.actor', '', false), "
+                        "set_config('app.actor_type', '', false), "
+                        "set_config('app.session_key', '', false)"
+                    )
+                except Exception:
+                    pass
+
+    async def fetch(self, sql, *a):
+        async with self.acquire() as c: return await c.fetch(sql, *a)
+    async def fetchrow(self, sql, *a):
+        async with self.acquire() as c: return await c.fetchrow(sql, *a)
+    async def fetchval(self, sql, *a):
+        async with self.acquire() as c: return await c.fetchval(sql, *a)
+    async def execute(self, sql, *a):
+        async with self.acquire() as c: return await c.execute(sql, *a)
+    async def executemany(self, sql, args_list):
+        async with self.acquire() as c: return await c.executemany(sql, args_list)
+    def __getattr__(self, name): return getattr(self._pool, name)
+
+
+# ============================================================================
+# COMPILED CODE CACHE
+# ============================================================================
+
+_CODE_CACHE: Dict[str, tuple] = {}
+
+
+# ============================================================================
+# TOOL GLOBALS — repair execution scope
+# ============================================================================
+
+async def _repair_platform_call(tool_name: str, arguments: dict | None = None, **_kw) -> dict:
+    raise RuntimeError(
+        f"_platform_call('{tool_name}') unavailable in repair mode — "
+        f"mcpdb is unreachable. Repair tools must be self-contained."
+    )
+
+async def _job_checkpoint(job_id, progress_pct=None, progress_note=None, checkpoint=None):
+    return True
+
+_TOOL_GLOBALS: Dict[str, Any] = {
+    "asyncio": asyncio, "httpx": httpx, "json": json, "os": os, "logger": log,
+    "coerce_args": coerce_args, "coerce_sql_vals": coerce_sql_vals,
+    "db_execute": db_execute, "db_fetch": db_fetch,
+    "db_fetchrow": db_fetchrow, "db_fetchval": db_fetchval, "db_executemany": db_executemany,
+    "_chain_context": _chain_context, "_trace_ctx": _trace_ctx, "_request_meta": _request_meta,
+    "_write_assertion": _write_assertion, "_write_error_bus": _write_error_bus,
+    "_emit_span": _emit_span, "_platform_call": _repair_platform_call,
+    "_job_checkpoint": _job_checkpoint, "JobPaused": JobPaused,
+}
+
+
+# ============================================================================
+# FORWARD ENGINE
+# ============================================================================
+
+_MCPDB_EXECUTE_URL: str = os.environ.get(
+    "MCPDB_EXECUTE_URL",
+    "https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute",
+)
+_MCPDB_AUDIENCE: str = os.environ.get(
+    "MCPDB_AUDIENCE",
+    "https://miller-mcp-db-v3-irj2rlhsea-uc.a.run.app",
+)
+_METADATA_IDENTITY_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/"
+    "service-accounts/default/identity?audience={audience}&format=full"
+)
+_oidc_cache: dict = {"token": None, "expires_at": 0.0}
+
+
+class _ForwardFailed(Exception):
+    pass
+
+
+async def _get_oidc_token() -> str:
+    now = time.monotonic()
+    if _oidc_cache["token"] and now < _oidc_cache["expires_at"]:
+        return _oidc_cache["token"]
+    url = _METADATA_IDENTITY_URL.format(audience=_MCPDB_AUDIENCE)
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(url, headers={"Metadata-Flavor": "Google"})
+        resp.raise_for_status()
+    token = resp.text.strip()
+    try:
+        import base64 as _b64
+        _parts = token.split(".")
+        _pad = _parts[1] + "=" * (-len(_parts[1]) % 4)
+        _payload = json.loads(_b64.urlsafe_b64decode(_pad))
+        _oidc_cache["token"] = token
+        _oidc_cache["expires_at"] = float(_payload.get("exp", now + 3600)) - 300
+    except Exception:
+        _oidc_cache["token"] = token
+        _oidc_cache["expires_at"] = now + 3000
+    return token
+
+
+async def _forward_to_mcpdb(tool_name: str, arguments: Dict[str, Any], trace_id: str) -> Any:
+    """POST to miller-mcp-db-v3 /execute via OIDC. Raises _ForwardFailed on 5xx/network error."""
+    token = await _get_oidc_token()
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Caller-Tool": "mcp-gateway",
+    }
+    _tc = _trace_ctx.get()
+    if _tc.get("trace_id") and _tc.get("span_id"):
+        headers["traceparent"] = f"00-{_tc['trace_id']}-{_tc['span_id']}-01"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(95.0, connect=5.0)) as client:
+            resp = await client.post(
+                _MCPDB_EXECUTE_URL,
+                json={"tool_name": tool_name, "arguments": arguments},
+                headers=headers,
+            )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise _ForwardFailed(f"network error: {exc}") from exc
+    if resp.status_code in (502, 503, 504):
+        raise _ForwardFailed(f"mcpdb returned HTTP {resp.status_code}")
+    if resp.status_code == 400:
+        data = resp.json()
+        raise ValueError(data.get("error", f"bad request: {resp.text[:200]}"))
+    if resp.status_code == 401:
+        raise RuntimeError("gateway OIDC token rejected by mcpdb — check MCPDB_AUDIENCE")
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("result", data)
+
+
+async def _execute_repair(
+    tool_name: str, arguments: Dict[str, Any], trace_id: str, row: asyncpg.Record,
+) -> Any:
+    """Minimal local execution — repair tools only (tool_status='repair' enforced by caller)."""
+    code = row["code"]; schema = row["input_schema"]; version = row["version"]
+    arguments = coerce_args(arguments, schema)
+    cache_entry = _CODE_CACHE.get(tool_name)
+    if cache_entry is None or cache_entry[0] != version:
+        try:
+            compiled = compile(code, f"<tool:{tool_name}>", "exec")
+            _CODE_CACHE[tool_name] = (version, compiled)
+        except SyntaxError as exc:
+            raise RuntimeError(f"[repair] Tool '{tool_name}' syntax error: {exc}") from exc
+    else:
+        compiled = cache_entry[1]
+    _sk = arguments.get("session_key", "") if isinstance(arguments, dict) else ""
+    _audit_pool = _AuditPool(db_pool, tool_name, "ai", _sk)
+    scope: Dict[str, Any] = {
+        **_TOOL_GLOBALS, "db_pool": _audit_pool,
+        "_caller_tool": None, "args": arguments, "_is_degraded": False,
+    }
+    try:
+        exec(compiled, scope)
+    except SyntaxError as exc:
+        raise RuntimeError(f"[repair] Tool '{tool_name}' syntax error: {exc}") from exc
+    run_fn = scope.get("run")
+    if run_fn is None:
+        raise RuntimeError(f"[repair] Tool '{tool_name}' must define async def run(args)")
+    if not inspect.iscoroutinefunction(run_fn):
+        raise RuntimeError(f"[repair] Tool '{tool_name}': run must be async")
+    _timeout_sec = TOOL_TIMEOUT
+    try:
+        async with db_pool.acquire() as conn:
+            _t = await conn.fetchval(
+                "SELECT timeout_seconds FROM execution_timeout_config WHERE tool_name = $1",
+                tool_name,
+            )
+        if _t is not None: _timeout_sec = _t
+    except Exception:
+        pass
+    t0 = time.monotonic(); status = "success"; error_type = None; result = None
+    _chain = {k: arguments[k] for k in _CHAIN_KEYS if isinstance(arguments, dict) and arguments.get(k)}
+    _chain_token = _chain_context.set(_chain) if _chain else None
+    try:
+        result = await asyncio.wait_for(run_fn(arguments), timeout=_timeout_sec)
+        asyncio.create_task(_assert_output(result, row.get("output_schema"), tool_name, trace_id))
+        if isinstance(result, dict) and "trace_id" not in result:
+            result["trace_id"] = trace_id
+    except asyncio.TimeoutError:
+        status = "error"; error_type = "TimeoutError"
+        raise RuntimeError(f"[repair] Tool '{tool_name}' timed out after {_timeout_sec}s.")
+    except Exception as e:
+        status = "error"; error_type = type(e).__name__
+        import traceback as _tb
+        await _write_error_bus(
+            "gateway_repair_dispatch", tool_name=tool_name,
+            error_name=type(e).__name__, error_msg=str(e)[:500],
+            stack_trace=_tb.format_exc()[:5000], trace_id=trace_id,
+            context={"version": version, "mode": "repair"},
+        )
+        raise
+    finally:
+        if _chain_token is not None: _chain_context.reset(_chain_token)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.info("[repair] Tool '%s' %s (%dms)", tool_name, status.upper(), duration_ms,
+                 extra={"trace_id": trace_id, "tool_name": tool_name, "duration_ms": duration_ms})
+        _tc = _trace_ctx.get()
+        if _tc.get("trace_id") and db_pool:
+            asyncio.create_task(_emit_span(
+                trace_id=_tc["trace_id"], span_id=_tc.get("span_id") or os.urandom(8).hex(),
+                parent_span_id=_tc.get("parent_span_id"), service="gateway_repair",
+                operation="repair_dispatch", tool_name=tool_name, duration_ms=duration_ms,
+                status=status, error_type=error_type, attributes={"version": version, "mode": "repair"},
+            ))
+    if isinstance(result, dict) and row.get("operational_intel"):
+        _oi = row["operational_intel"]
+        result["_intel"] = json.loads(_oi) if isinstance(_oi, str) else _oi
+    return result
+
+
+# ============================================================================
+# _dispatch — OIDC FORWARD + REPAIR FALLBACK
+# ============================================================================
+
+async def _dispatch(tool_name: str, arguments: Dict[str, Any], trace_id: str | None = None) -> Any:
+    if trace_id is None:
+        trace_id = str(uuid.uuid4())
+    _dispatch_span_id = os.urandom(8).hex()
+    _existing_tc = _trace_ctx.get()
+    _trace_token = None
+    if not _existing_tc.get("trace_id"):
+        _trace_token = _trace_ctx.set({"trace_id": trace_id, "span_id": _dispatch_span_id, "parent_span_id": None})
+    else:
+        _trace_token = _trace_ctx.set({"trace_id": _existing_tc["trace_id"], "span_id": _dispatch_span_id, "parent_span_id": _existing_tc.get("span_id")})
+    try:
+        # Normal path
+        try:
+            return await _forward_to_mcpdb(tool_name, arguments, trace_id)
+        except _ForwardFailed as fwd_exc:
+            log.warning("gateway: forward failed '%s': %s", tool_name, fwd_exc, extra={"tool_name": tool_name})
+            asyncio.create_task(_write_error_bus(
+                "gateway_forward_failed", tool_name=tool_name, error_name="ForwardFailed",
+                error_msg=str(fwd_exc)[:500], trace_id=trace_id,
+                context={"mcpdb_url": _MCPDB_EXECUTE_URL},
+            ))
+        # Repair path
+        if not db_pool:
+            raise RuntimeError("mcpdb unreachable and gateway DB pool unavailable.")
+        row = await db_pool.fetchrow(
+            "SELECT code, input_schema, output_schema, operational_intel, version, tool_status "
+            "FROM tool_registry WHERE name = $1 AND enabled = TRUE",
+            tool_name,
+        )
+        if row is None:
+            async with db_pool.acquire() as conn:
+                count = await conn.fetchval("SELECT COUNT(*) FROM tool_registry WHERE enabled = TRUE")
+            raise ValueError(f"Tool '{tool_name}' not found in registry ({count} tools).")
+        if row["tool_status"] != "repair":
+            raise RuntimeError(
+                f"mcpdb unreachable and '{tool_name}' (status='{row['tool_status']}') "
+                f"is not tagged for repair fallback. Only tool_status='repair' tools run locally."
+            )
+        log.info("gateway: repair fallback '%s'", tool_name, extra={"tool_name": tool_name, "mcpdb_status": "down"})
+        return await _execute_repair(tool_name, arguments, trace_id, row)
+    finally:
+        if _trace_token is not None:
+            _trace_ctx.reset(_trace_token)
+
+
+_TOOL_GLOBALS["_dispatch"] = _dispatch
 
 
 # ============================================================================
@@ -600,6 +687,7 @@ class _ActiveRequestMiddleware(BaseHTTPMiddleware):
         finally:
             _active_requests -= 1
 
+
 # ============================================================================
 # LIFESPAN
 # ============================================================================
@@ -607,21 +695,23 @@ class _ActiveRequestMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
-    log.info("MCP Gateway v4 starting...")
+    log.info("MCP Gateway v5 starting (S1038 forward+repair)...")
     db_pool = await asyncpg.create_pool(
         DATABASE_URL, min_size=POOL_MIN, max_size=POOL_MAX,
         command_timeout=TOOL_TIMEOUT, statement_cache_size=0,
     )
     _TOOL_GLOBALS["db_pool"] = db_pool
     tool_count = await db_pool.fetchval("SELECT count(*) FROM tool_registry WHERE enabled = true")
-    log.info("Pool ready — %d enabled tools", tool_count, extra={"tool_count": int(tool_count)})
-
+    repair_count = await db_pool.fetchval(
+        "SELECT count(*) FROM tool_registry WHERE enabled = true AND tool_status = 'repair'"
+    )
+    log.info("Pool ready — %d tools (%d repair-tagged)", tool_count, repair_count,
+             extra={"tool_count": int(tool_count)})
     async def _secret_refresh():
         while True:
             await asyncio.sleep(300)
             try: load_secrets()
             except Exception: log.exception("Secret refresh failed")
-
     refresh_task = asyncio.create_task(_secret_refresh())
     async with mcp.session_manager.run():
         try:
@@ -629,15 +719,14 @@ async def lifespan(app: FastAPI):
         finally:
             refresh_task.cancel()
             if _active_requests > 0:
-                log.info("Shutdown: draining %d requests (max 8s)...", _active_requests)
+                log.info("Shutdown: draining %d requests...", _active_requests)
                 for _ in range(80):
                     if _active_requests == 0: break
                     await asyncio.sleep(0.1)
-                if _active_requests > 0:
-                    log.warning("Shutdown: %d requests still active — proceeding", _active_requests)
             _CODE_CACHE.clear()
             await db_pool.close()
             log.info("Shutdown complete")
+
 
 # ============================================================================
 # FASTMCP + FASTAPI
@@ -647,70 +736,88 @@ mcp = FastMCP(
     "MillerMCPGateway", stateless_http=True, json_response=True,
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
-
-# Build sub-app once (initializes session_manager lazily).
-# Must happen before lifespan so session_manager.run() can be entered.
 _mcp_sub_app = mcp.streamable_http_app()
+
 
 @mcp.tool()
 async def meta_tool(tool_name: str, arguments: Any = None) -> Any:
-    """
-    Execute any tool in the registry. Internal tools (tool_status='internal')
-    are blocked from direct MCP calls — platform-to-platform use only.
-    """
+    """Execute any tool in the registry. Internal tools blocked from MCP."""
+    # Guard: catch MCP framework self-injection quirk
+    if tool_name in ("meta_tool", "ping", "gateway_status", ""):
+        return {"status": "error", "error": (
+            f"'{tool_name}' is a native gateway tool. Provide a tool_registry tool name."
+        )}
     if db_pool:
         tool_status = await db_pool.fetchval(
             "SELECT tool_status FROM tool_registry WHERE name=$1 AND enabled=TRUE", tool_name,
         )
         if tool_status == "internal":
-            return {"status": "error", "error": (
-                f"Tool '{tool_name}' is internal and cannot be called directly via MCP."
-            )}
+            return {"status": "error", "error": f"Tool '{tool_name}' is internal — MCP blocked."}
     if isinstance(arguments, str):
         try: arguments = json.loads(arguments)
         except (json.JSONDecodeError, TypeError): arguments = {}
     if not isinstance(arguments, dict): arguments = {}
-    # S934: generate W3C traceparent at the MCP entry point — root span for this request
-    _t_trace_id = uuid.uuid4().hex           # 32 hex chars
-    _t_span_id  = os.urandom(8).hex()        # 16 hex chars
-    _t_tok = _trace_ctx.set({
-        'trace_id':       _t_trace_id,
-        'span_id':        _t_span_id,
-        'parent_span_id': None,
-    })
+    _t_trace_id = uuid.uuid4().hex
+    _t_span_id  = os.urandom(8).hex()
+    _t_tok = _trace_ctx.set({"trace_id": _t_trace_id, "span_id": _t_span_id, "parent_span_id": None})
     try:
         return await _dispatch(tool_name, arguments, trace_id=_t_trace_id)
     finally:
         _trace_ctx.reset(_t_tok)
+
 
 @mcp.tool()
 def ping() -> str:
     """Returns pong — verifies MCP gateway connectivity."""
     return "pong"
 
+
 @mcp.tool()
 async def gateway_status() -> dict:
-    """Returns live health: DB status, tool count, cache stats."""
+    """Live health: DB, tool count, mcpdb reachability, repair tool count."""
     info: Dict[str, Any] = {
-        "gateway": "MCP Gateway v4 — Enterprise Edition",
+        "gateway": "MCP Gateway v5 — S1038 Forward+Repair",
+        "strategy": "OIDC forward to mcpdb; repair fallback for tool_status='repair'",
+        "mcpdb_execute_url": _MCPDB_EXECUTE_URL,
+        "mcpdb_audience": _MCPDB_AUDIENCE,
         "timeout_s": TOOL_TIMEOUT, "pool": f"{POOL_MIN}-{POOL_MAX}",
         "compile_cache_size": len(_CODE_CACHE), "active_requests": _active_requests,
     }
-    if os.path.isdir(SECRETS_DIR): info["secrets"] = len(os.listdir(SECRETS_DIR))
+    try:
+        token = await _get_oidc_token()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            resp = await client.get(
+                _MCPDB_EXECUTE_URL.replace("/execute", "/health"),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        info["mcpdb_status"] = "reachable" if resp.status_code < 500 else f"http_{resp.status_code}"
+        info["mcpdb_http_status"] = resp.status_code
+    except _ForwardFailed as e:
+        info["mcpdb_status"] = f"unreachable: {e}"
+    except Exception as e:
+        info["mcpdb_status"] = f"probe_error: {type(e).__name__}: {str(e)[:100]}"
+    if os.path.isdir(SECRETS_DIR):
+        info["secrets"] = len(os.listdir(SECRETS_DIR))
     if db_pool:
         try:
             t0 = time.monotonic()
             n = await db_pool.fetchval("SELECT count(*) FROM tool_registry WHERE enabled = true")
-            info["db"] = "connected"; info["enabled_tools"] = int(n)
+            r = await db_pool.fetchval(
+                "SELECT count(*) FROM tool_registry WHERE enabled = true AND tool_status = 'repair'"
+            )
+            info["db"] = "connected"
+            info["enabled_tools"] = int(n)
+            info["repair_tools"] = int(r)
             info["db_latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
         except Exception as exc:
             info["db"] = f"error: {exc}"
     return info
 
+
 app = FastAPI(
     title="MillerMCPGateway",
-    description="Miller IQ Platform MCP Gateway — tool execution layer",
-    version="4.0.0", lifespan=lifespan,
+    description="Miller IQ MCP Gateway v5 — OIDC forward + repair fallback",
+    version="5.0.0", lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
     allow_methods=["GET","POST","PATCH","PUT","DELETE","OPTIONS"],
@@ -720,9 +827,9 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(TraceMiddleware)
 app.add_middleware(_ActiveRequestMiddleware)
 
+
 @app.get("/health")
 async def health():
-    """HTTP health endpoint for Cloud Run probes and capture_service_metrics cron."""
     db_ok = False; tool_count = 0; db_latency = None
     if db_pool:
         try:
@@ -736,13 +843,12 @@ async def health():
         except Exception:
             pass
     return {
-        "status": "ok" if db_ok else "degraded",
-        "service": "miller-mcp-gateway", "version": "4.0.0",
-        "db": "connected" if db_ok else "unreachable",
+        "status": "ok" if db_ok else "degraded", "service": "miller-mcp-gateway",
+        "version": "5.0.0", "db": "connected" if db_ok else "unreachable",
         "db_latency_ms": db_latency, "tool_count": tool_count,
         "compile_cache_size": len(_CODE_CACHE), "active_requests": _active_requests,
+        "strategy": "forward+repair",
     }
 
-# Mount at / so FastMCP's internal /mcp route is reachable at /mcp externally.
-app.mount("/", _mcp_sub_app)
 
+app.mount("/", _mcp_sub_app)
