@@ -902,4 +902,137 @@ async def health():
     }
 
 
+# ============================================================================
+# GCS STAGE UPLOAD — S1042 Chat-drop-to-CloudTask bridge
+#
+# bash_tool reads /mnt/user-data/uploads/{filename} → POST raw bytes here.
+# Gateway has GCP metadata server access; bash_tool does not.
+# Pure relay: zero byte inspection, zero transformation.
+# Returns gs:// URL → caller fires load_reference_spreadsheet via fire_cloud_task.
+# ============================================================================
+
+_PLATFORM_API_KEY = os.environ.get("PLATFORM_API_KEY", "miller-techstack-2026")
+_GCS_UPLOAD_URL   = "https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media&name={name}"
+_GCS_TOKEN_URL    = ("http://metadata.google.internal/computeMetadata/v1/instance/"
+                     "service-accounts/default/token")
+
+
+@app.post("/upload/gcs-stage")
+async def gcs_stage(request: Request):
+    """
+    S1042 — Raw file bytes passthrough: chat upload → GCS.
+
+    Called by bash_tool after reading /mnt/user-data/uploads/{filename}.
+    Gateway holds GCP credentials; bash_tool does not.
+    Pure relay: zero byte inspection, zero transformation.
+
+    Request headers:
+        X-API-Key    (required) — platform API key
+        X-Filename   (required) — original filename (e.g. ZIP_COUNTY_122025.xlsx)
+        X-GCS-Path   (required) — GCS object path (e.g. reference-data/hud/ZIP_COUNTY_122025.xlsx)
+        X-GCS-Bucket (optional) — GCS bucket (default: miller-platform-assets)
+        Content-Type (optional) — passed through to GCS
+
+    Returns:
+        {status, gcs_url, size_bytes, filename, bucket, gcs_path, trace_id}
+
+    Full chat-drop flow:
+        bash_tool reads /mnt/user-data/uploads/{filename}
+        POST /upload/gcs-stage → {gcs_url}
+        load_reference_spreadsheet(gcs_url, dry_run=True) → validate
+        fire_cloud_task(tool_name='load_reference_spreadsheet', args={gcs_url, ...}) → job_id
+    """
+    import urllib.parse as _up
+
+    trace_id = getattr(request.state, "trace_id", None) or str(uuid.uuid4())
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != _PLATFORM_API_KEY:
+        log.warning("gcs_stage: unauthorized attempt", extra={"trace_id": trace_id})
+        return JSONResponse({"error": "unauthorized", "trace_id": trace_id}, status_code=401)
+
+    # ── Headers ──────────────────────────────────────────────────────────────
+    filename   = request.headers.get("X-Filename", "").strip()
+    gcs_path   = request.headers.get("X-GCS-Path", "").strip()
+    bucket     = request.headers.get("X-GCS-Bucket", "miller-platform-assets").strip()
+    media_type = request.headers.get("Content-Type", "application/octet-stream")
+
+    if not filename:
+        return JSONResponse({"error": "X-Filename header is required", "trace_id": trace_id}, status_code=400)
+    if not gcs_path:
+        gcs_path = f"uploads/{filename}"
+
+    # ── Read body ─────────────────────────────────────────────────────────────
+    try:
+        raw_bytes = await request.body()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read body: {e}", "trace_id": trace_id}, status_code=400)
+
+    if not raw_bytes:
+        return JSONResponse({"error": "Empty body — no bytes received", "trace_id": trace_id}, status_code=400)
+
+    size_bytes = len(raw_bytes)
+
+    # ── GCP token ─────────────────────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as _tc:
+            _tok = await _tc.get(_GCS_TOKEN_URL, headers={"Metadata-Flavor": "Google"})
+            _tok.raise_for_status()
+        gcp_token = _tok.json()["access_token"]
+    except Exception as e:
+        log.error("gcs_stage: GCP token failed: %s", e, extra={"trace_id": trace_id})
+        asyncio.create_task(_write_error_bus(
+            "gcs_stage", error_name="GCPTokenError",
+            error_msg=str(e)[:300], trace_id=trace_id,
+        ))
+        return JSONResponse({"error": f"GCP auth failed: {e}", "trace_id": trace_id}, status_code=500)
+
+    # ── Upload to GCS — pure passthrough ──────────────────────────────────────
+    encoded_path = _up.quote(gcs_path, safe="")
+    upload_url   = _GCS_UPLOAD_URL.format(bucket=bucket, name=encoded_path)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as _gc:
+            _resp = await _gc.post(
+                upload_url,
+                content=raw_bytes,
+                headers={
+                    "Authorization": f"Bearer {gcp_token}",
+                    "Content-Type":  media_type,
+                    "Content-Length": str(size_bytes),
+                },
+            )
+        if _resp.status_code not in (200, 201):
+            err = f"GCS upload HTTP {_resp.status_code}: {_resp.text[:200]}"
+            log.error("gcs_stage: %s", err, extra={"trace_id": trace_id})
+            asyncio.create_task(_write_error_bus(
+                "gcs_stage", error_name="GCSUploadError", error_msg=err, trace_id=trace_id,
+                context={"bucket": bucket, "gcs_path": gcs_path, "size_bytes": size_bytes},
+            ))
+            return JSONResponse({"error": err, "trace_id": trace_id}, status_code=502)
+    except Exception as e:
+        log.error("gcs_stage: upload exception: %s", e, extra={"trace_id": trace_id})
+        asyncio.create_task(_write_error_bus(
+            "gcs_stage", error_name="GCSUploadException",
+            error_msg=str(e)[:300], trace_id=trace_id,
+        ))
+        return JSONResponse({"error": f"GCS upload failed: {e}", "trace_id": trace_id}, status_code=500)
+
+    gcs_url = f"gs://{bucket}/{gcs_path}"
+    log.info(
+        "gcs_stage: %s → %s (%d bytes)",
+        filename, gcs_url, size_bytes,
+        extra={"trace_id": trace_id},
+    )
+    return JSONResponse({
+        "status":     "ok",
+        "gcs_url":    gcs_url,
+        "size_bytes": size_bytes,
+        "filename":   filename,
+        "bucket":     bucket,
+        "gcs_path":   gcs_path,
+        "trace_id":   trace_id,
+    })
+
+
 app.mount("/", _mcp_sub_app)
