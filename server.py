@@ -751,6 +751,7 @@ async def lifespan(app: FastAPI):
         DATABASE_URL, min_size=POOL_MIN, max_size=POOL_MAX,
         command_timeout=TOOL_TIMEOUT, statement_cache_size=0,
     )
+    await load_jwt_secret(db_pool)
     _TOOL_GLOBALS["db_pool"] = db_pool
     tool_count = await db_pool.fetchval("SELECT count(*) FROM tool_registry WHERE enabled = true")
     repair_count = await db_pool.fetchval(
@@ -943,6 +944,7 @@ async def gcs_stage(request: Request):
         fire_cloud_task(tool_name='load_reference_spreadsheet', args={gcs_url, ...}) → job_id
     """
     import urllib.parse as _up
+from miller_jwt_gateway import load_jwt_secret, build_auth_headers
 
     trace_id = getattr(request.state, "trace_id", None) or str(uuid.uuid4())
 
