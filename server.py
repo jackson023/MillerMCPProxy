@@ -472,6 +472,13 @@ _METADATA_IDENTITY_URL = (
     "service-accounts/default/identity?audience={audience}&format=full"
 )
 _oidc_cache: dict = {"token": None, "expires_at": 0.0}
+# ── Layer 4: OIDC self-healing ────────────────────────────────────────────────
+# Tracks consecutive 401s from mcpdb. At _OIDC_HEAL_THRESHOLD, the gateway
+# resets _MCPDB_AUDIENCE to the base URL derived from _MCPDB_EXECUTE_URL,
+# clears the token cache, and fires an error_bus event. Resets to 0 on any
+# successful forward. Handles audience mismatch silently within 3 requests.
+_oidc_failure_count: int = 0
+_OIDC_HEAL_THRESHOLD: int = 3
 
 
 class _ForwardFailed(Exception):
@@ -526,8 +533,53 @@ async def _forward_to_mcpdb(tool_name: str, arguments: Dict[str, Any], trace_id:
         data = resp.json()
         raise ValueError(data.get("error", f"bad request: {resp.text[:200]}"))
     if resp.status_code == 401:
-        raise RuntimeError("gateway OIDC token rejected by mcpdb — check MCPDB_AUDIENCE")
+        global _oidc_failure_count, _MCPDB_AUDIENCE
+        _oidc_failure_count += 1
+        _failures = _oidc_failure_count
+        log.error(
+            "gateway: OIDC 401 from mcpdb (failure %d/%d) — audience=%s tool=%s",
+            _failures, _OIDC_HEAL_THRESHOLD, _MCPDB_AUDIENCE, tool_name,
+            extra={"tool_name": tool_name},
+        )
+        if _failures >= _OIDC_HEAL_THRESHOLD:
+            # ── Self-heal: derive correct audience from execute URL, bust cache ──
+            _old_audience = _MCPDB_AUDIENCE
+            _healed = _MCPDB_EXECUTE_URL.rsplit("/execute", 1)[0].rstrip("/")
+            _MCPDB_AUDIENCE = _healed
+            _oidc_cache["token"] = None
+            _oidc_cache["expires_at"] = 0.0
+            _oidc_failure_count = 0
+            log.critical(
+                "gateway: OIDC self-heal fired — audience reset %s → %s, token cache cleared",
+                _old_audience, _healed,
+                extra={"tool_name": tool_name},
+            )
+            asyncio.create_task(_write_error_bus(
+                source="gateway_oidc_self_heal",
+                tool_name=tool_name,
+                error_name="OIDCSelfHeal",
+                error_msg=(
+                    f"{_OIDC_HEAL_THRESHOLD} consecutive 401s — "
+                    f"audience reset {_old_audience!r} → {_healed!r}, token cache cleared"
+                ),
+                trace_id=trace_id,
+                context={
+                    "old_audience":       _old_audience,
+                    "new_audience":       _healed,
+                    "mcpdb_execute_url":  _MCPDB_EXECUTE_URL,
+                    "tool_name":          tool_name,
+                    "consecutive_401s":   _failures,
+                },
+            ))
+        raise RuntimeError(
+            f"gateway OIDC token rejected by mcpdb "
+            f"(consecutive failures: {_failures}, audience: {_MCPDB_AUDIENCE})"
+        )
     resp.raise_for_status()
+    # ── Success: reset OIDC failure counter ───────────────────────────────────
+    if _oidc_failure_count > 0:
+        global _oidc_failure_count
+        _oidc_failure_count = 0
     data = resp.json()
     return data.get("result", data)
 
