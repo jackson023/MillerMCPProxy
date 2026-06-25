@@ -93,10 +93,18 @@ async def _handle_initialize(params, req_id):
         "serverInfo": {"name": "miller-mcp-gateway", "version": "2.0.0"},
     })
 
+# Bootstrap tools exposed to Claude via MCP tools/list.
+# ALL other tools are reachable via meta_tool — never advertised directly.
+# Exposing all 1,600+ tools floods Claude's context window and breaks the
+# meta_tool dispatch architecture. This list must stay exactly 3 entries.
+_BOOTSTRAP_TOOLS = ("meta_tool", "ping", "gateway_status")
+
 async def _handle_tools_list(params, req_id):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT name, description, input_schema FROM tool_registry WHERE enabled = TRUE ORDER BY name"
+            "SELECT name, description, input_schema FROM tool_registry "
+            "WHERE name = ANY($1) AND enabled = TRUE ORDER BY name",
+            list(_BOOTSTRAP_TOOLS),
         )
     tools = []
     for r in rows:
