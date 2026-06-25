@@ -578,7 +578,6 @@ async def _forward_to_mcpdb(tool_name: str, arguments: Dict[str, Any], trace_id:
     resp.raise_for_status()
     # ── Success: reset OIDC failure counter ───────────────────────────────────
     if _oidc_failure_count > 0:
-        global _oidc_failure_count
         _oidc_failure_count = 0
     data = resp.json()
     return data.get("result", data)
