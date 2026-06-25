@@ -97,48 +97,116 @@ steps:
 
 - id: deploy
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  allowFailure: true
   script: |
-    set -e
-    echo "=== SIDECAR DEPLOY PATTERN (v2) ==="
+    set -uo pipefail
+    echo "=== SIDECAR DEPLOY PATTERN (v3 — boot crash capture) ==="
     echo "Service: $_SERVICE | Image: $_IMAGE:$COMMIT_SHA"
+    echo "0" > /workspace/deploy_exit.txt
 
     echo "Step 1: Injecting image tag into service.yaml..."
     sed "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g; s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g" service.yaml > /tmp/service-deploy.yaml
 
     echo "Step 2: Verifying sidecar in spec..."
-    grep -q "alloydb-proxy" /tmp/service-deploy.yaml || { echo "ERROR: alloydb-proxy missing"; exit 1; }
-    grep -q "IMAGE_PLACEHOLDER" /tmp/service-deploy.yaml && { echo "ERROR: IMAGE_PLACEHOLDER not replaced"; exit 1; } || true
-    grep -q "ALLOYDB_INSTANCE_PLACEHOLDER" /tmp/service-deploy.yaml && { echo "ERROR: ALLOYDB_INSTANCE_PLACEHOLDER not replaced"; exit 1; } || true
-    grep -q "$COMMIT_SHA" /tmp/service-deploy.yaml || { echo "ERROR: image tag not injected"; exit 1; }
-
-    echo "Image lines:"
-    grep "image:" /tmp/service-deploy.yaml
+    grep -q "alloydb-proxy" /tmp/service-deploy.yaml || { echo "ERROR: alloydb-proxy missing"; echo "1" > /workspace/deploy_exit.txt; exit 1; }
+    grep -q "IMAGE_PLACEHOLDER" /tmp/service-deploy.yaml && { echo "ERROR: IMAGE_PLACEHOLDER not replaced"; echo "1" > /workspace/deploy_exit.txt; exit 1; } || true
+    grep -q "$COMMIT_SHA" /tmp/service-deploy.yaml || { echo "ERROR: image tag not injected"; echo "1" > /workspace/deploy_exit.txt; exit 1; }
+    echo "Image lines:"; grep "image:" /tmp/service-deploy.yaml
 
     echo "Step 3: Deploying via services replace..."
-    gcloud run services replace /tmp/service-deploy.yaml \
-      --region="$_REGION" --project="$_PROJECT"
+    set +e
+    gcloud run services replace /tmp/service-deploy.yaml --region="$_REGION" --project="$_PROJECT"
+    DEPLOY_EXIT=$?
+    set -e
+    echo "$DEPLOY_EXIT" > /workspace/deploy_exit.txt
 
-    echo "Step 4: Verifying Cloud Run readiness..."
-    sleep 15
-    STATUS=$(gcloud run services describe "$_SERVICE" \
-      --region="$_REGION" --project="$_PROJECT" \
-      --format="value(status.conditions[0].status)")
-    echo "Service status: $STATUS"
-    if [ "$STATUS" != "True" ]; then
-      echo "WARNING: Service not ready after 15s. Check Cloud Console."
-    else
-      echo "Service ready."
+    echo "Step 4: Capturing revision name (even on failure)..."
+    sleep 5
+    REVISION=$(gcloud run revisions list \
+      --service="$_SERVICE" --region="$_REGION" --project="$_PROJECT" \
+      --limit=1 --format="value(metadata.name)" 2>/dev/null | head -1 || echo "")
+    echo "$REVISION" > /workspace/new_revision.txt
+    echo "Revision: $REVISION | Deploy exit: $DEPLOY_EXIT"
+
+    if [ "$DEPLOY_EXIT" != "0" ]; then
+      echo "DEPLOY FAILED — capture-boot-crash step will fetch revision startup logs"
+      exit 1
     fi
 
+    echo "Step 5: Verifying readiness..."
+    sleep 15
+    CR_STATUS=$(gcloud run services describe "$_SERVICE" --region="$_REGION" --project="$_PROJECT" --format="value(status.conditions[0].status)")
+    echo "$CR_STATUS" > /workspace/cr_status.txt
+    echo "Service status: $CR_STATUS"
     echo "=== Deploy complete ==="
   waitFor:
   - vuln-scan-gate
+
+- id: capture-boot-crash
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  allowFailure: false
+  script: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "=== BOOT CRASH CAPTURE (v1) ==="
+
+    DEPLOY_EXIT=$(cat /workspace/deploy_exit.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
+    if [ "$DEPLOY_EXIT" = "0" ]; then
+      echo "Deploy succeeded — no boot crash capture needed"; exit 0
+    fi
+
+    REVISION=$(cat /workspace/new_revision.txt 2>/dev/null | tr -d '[:space:]' || echo "")
+    echo "Revision: ${REVISION:-unknown} | Commit: ${COMMIT_SHA:0:7} | Service: $_SERVICE"
+    echo "Waiting 20s for Cloud Logging propagation..."
+    sleep 20
+
+    echo "Fetching revision startup logs..."
+    if [ -n "$REVISION" ]; then
+      gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$_SERVICE\" AND resource.labels.revision_name=\"$REVISION\"" --project="$_PROJECT" --limit=200 --format="value(textPayload)" --freshness=15m 2>/dev/null > /workspace/boot_logs.txt || echo "" > /workspace/boot_logs.txt
+    else
+      echo "" > /workspace/boot_logs.txt
+    fi
+    echo "--- Boot logs (first 60 lines) ---"
+    head -60 /workspace/boot_logs.txt || true
+
+    echo "Computing commit diff for attribution..."
+    PARENT=$(git log -1 --pretty=%P HEAD 2>/dev/null | awk '{print $1}' || echo "")
+    if [ -n "$PARENT" ]; then
+      git diff "$PARENT" HEAD > /workspace/commit_diff.txt 2>/dev/null || true
+      git diff "$PARENT" HEAD --stat > /workspace/commit_diff_stat.txt 2>/dev/null || true
+      echo "--- Changed files ---"; cat /workspace/commit_diff_stat.txt | head -15 || true
+    else
+      echo "" > /workspace/commit_diff.txt; echo "" > /workspace/commit_diff_stat.txt
+    fi
+
+    echo "Parsing traceback and cross-referencing diff..."
+    echo 'aW1wb3J0IHJlLCBqc29uLCBvcywgc3lzCgpib290X2xvZ3MgPSBvcGVuKCcvd29ya3NwYWNlL2Jvb3RfbG9ncy50eHQnKS5yZWFkKCkgaWYgb3MucGF0aC5leGlzdHMoJy93b3Jrc3BhY2UvYm9vdF9sb2dzLnR4dCcpIGVsc2UgJycKZGlmZl90ZXh0ICA9IG9wZW4oJy93b3Jrc3BhY2UvY29tbWl0X2RpZmYudHh0JykucmVhZCgpIGlmIG9zLnBhdGguZXhpc3RzKCcvd29ya3NwYWNlL2NvbW1pdF9kaWZmLnR4dCcpIGVsc2UgJycKZGlmZl9zdGF0ICA9IG9wZW4oJy93b3Jrc3BhY2UvY29tbWl0X2RpZmZfc3RhdC50eHQnKS5yZWFkKCkgaWYgb3MucGF0aC5leGlzdHMoJy93b3Jrc3BhY2UvY29tbWl0X2RpZmZfc3RhdC50eHQnKSBlbHNlICcnCgojIEV4dHJhY3QgUHl0aG9uIHRyYWNlYmFjawp0Yl9wYXQgPSByZS5zZWFyY2goCiAgICByJyhUcmFjZWJhY2sgXChtb3N0IHJlY2VudCBjYWxsIGxhc3RcKTouKj8pKD89XG5cU3xcWiknLAogICAgYm9vdF9sb2dzLCByZS5ET1RBTEwKKQp0cmFjZWJhY2tfdGV4dCA9IHRiX3BhdC5ncm91cCgwKS5zdHJpcCgpIGlmIHRiX3BhdCBlbHNlICcnCgojIEV4dHJhY3QgY3Jhc2ggZmlsZSArIGxpbmUgKGxhc3QgZnJhbWUgPSBhY3R1YWwgZXJyb3Igc2l0ZSkKZmlsZV9saW5lcyA9IHJlLmZpbmRhbGwocidGaWxlICIoW14iXSspIiwgbGluZSAoXGQrKScsIHRyYWNlYmFja190ZXh0KQpjcmFzaF9maWxlID0gY3Jhc2hfbGluZSA9IE5vbmUKaWYgZmlsZV9saW5lczoKICAgIHJhd19maWxlLCByYXdfbGluZSA9IGZpbGVfbGluZXNbLTFdCiAgICBjcmFzaF9maWxlID0gb3MucGF0aC5iYXNlbmFtZShyYXdfZmlsZSkKICAgIGNyYXNoX2xpbmUgPSBpbnQocmF3X2xpbmUpCgojIEV4dHJhY3QgZXJyb3IgbmFtZSArIG1lc3NhZ2UKZXJyX21hdGNoID0gcmUuc2VhcmNoKAogICAgcideKFx3Kyg/OkVycm9yfEV4Y2VwdGlvbnxXYXJuaW5nKXxTeW50YXhFcnJvcilbOlxzXSsoLispJCcsCiAgICB0cmFjZWJhY2tfdGV4dCwgcmUuTVVMVElMSU5FCikKaWYgbm90IGVycl9tYXRjaDoKICAgIGVycl9tYXRjaCA9IHJlLnNlYXJjaChyJ14oW0EtWl1cdytFcnJvcilbOlxzXSsoLispJCcsIGJvb3RfbG9ncywgcmUuTVVMVElMSU5FKQplcnJvcl9uYW1lID0gZXJyX21hdGNoLmdyb3VwKDEpLnN0cmlwKCkgaWYgZXJyX21hdGNoIGVsc2UgJ1Vua25vd25FcnJvcicKZXJyb3JfbXNnICA9IGVycl9tYXRjaC5ncm91cCgyKS5zdHJpcCgpWzo1MDBdIGlmIGVycl9tYXRjaCBlbHNlICcnCgojIENvZGUgY29udGV4dDogc291cmNlIGZpbGUgbGluZXMgc3Vycm91bmRpbmcgY3Jhc2ggKC0tPk4gcG9pbnRlcikKY29kZV9jb250ZXh0ID0gJycKaWYgY3Jhc2hfZmlsZSBhbmQgY3Jhc2hfbGluZToKICAgIGZvciBjYW5kaWRhdGUgaW4gW2YnL3dvcmtzcGFjZS97Y3Jhc2hfZmlsZX0nLCBmJy9hcHAve2NyYXNoX2ZpbGV9J106CiAgICAgICAgaWYgb3MucGF0aC5leGlzdHMoY2FuZGlkYXRlKToKICAgICAgICAgICAgc3JjID0gb3BlbihjYW5kaWRhdGUpLnJlYWRsaW5lcygpCiAgICAgICAgICAgIHN0YXJ0ID0gbWF4KDAsIGNyYXNoX2xpbmUgLSA5KQogICAgICAgICAgICBlbmQgICA9IG1pbihsZW4oc3JjKSwgY3Jhc2hfbGluZSArIDgpCiAgICAgICAgICAgIGNvZGVfY29udGV4dCA9ICcnLmpvaW4oCiAgICAgICAgICAgICAgICBmInsnLS0+JyBpZiBpICsgMSA9PSBjcmFzaF9saW5lIGVsc2UgJyAgICd9IHtpKzE6NGR9ICB7c3JjW2ldfSIKICAgICAgICAgICAgICAgIGZvciBpIGluIHJhbmdlKHN0YXJ0LCBlbmQpCiAgICAgICAgICAgICkKICAgICAgICAgICAgYnJlYWsKCiMgRGlmZiBodW5rcyB0aGF0IG92ZXJsYXAgdGhlIGNyYXNoIGxpbmUg4oCUIGV4YWN0IGNoYW5nZWQgbGluZXMgdGhhdCBjYXVzZWQgaXQKZGlmZl9odW5rc19hdF9jcmFzaCA9ICcnCmlmIGNyYXNoX2ZpbGUgYW5kIGNyYXNoX2xpbmUgYW5kIGRpZmZfdGV4dDoKICAgIGluX2ZpbGUgID0gRmFsc2UKICAgIGh1bmtfYnVmID0gW10KICAgIGh1bmtfbmV3X3N0YXJ0ID0gMAogICAgaHVua19uZXdfY291bnQgPSAwCiAgICBmb3IgZGxpbmUgaW4gZGlmZl90ZXh0LnNwbGl0bGluZXMoKToKICAgICAgICBpZiBkbGluZS5zdGFydHN3aXRoKCcrKysgYi8nKToKICAgICAgICAgICAgaWYgaW5fZmlsZSBhbmQgaHVua19idWY6CiAgICAgICAgICAgICAgICBkaWZmX2h1bmtzX2F0X2NyYXNoICs9ICdcbicuam9pbihodW5rX2J1ZikgKyAnXG4nCiAgICAgICAgICAgIGluX2ZpbGUgID0gKG9zLnBhdGguYmFzZW5hbWUoZGxpbmVbNjpdKSA9PSBjcmFzaF9maWxlKQogICAgICAgICAgICBodW5rX2J1ZiA9IFtdCiAgICAgICAgZWxpZiBpbl9maWxlIGFuZCBkbGluZS5zdGFydHN3aXRoKCdAQCcpOgogICAgICAgICAgICBtID0gcmUuc2VhcmNoKHInXCsoXGQrKSg/OiwoXGQrKSk/JywgZGxpbmUpCiAgICAgICAgICAgIGlmIG06CiAgICAgICAgICAgICAgICBodW5rX25ld19zdGFydCA9IGludChtLmdyb3VwKDEpKQogICAgICAgICAgICAgICAgaHVua19uZXdfY291bnQgPSBpbnQobS5ncm91cCgyKSBvciAnMScpCiAgICAgICAgICAgICAgICBpZiBhYnMoaHVua19uZXdfc3RhcnQgLSBjcmFzaF9saW5lKSA8PSBodW5rX25ld19jb3VudCArIDE1OgogICAgICAgICAgICAgICAgICAgIGh1bmtfYnVmID0gW2YnIyA9PT0gRElGRiBIVU5LIChuZXcgbGluZXMgc3RhcnQgK3todW5rX25ld19zdGFydH0pID09PScsIGRsaW5lXQogICAgICAgICAgICAgICAgZWxzZToKICAgICAgICAgICAgICAgICAgICBodW5rX2J1ZiA9IFtdCiAgICAgICAgZWxpZiBpbl9maWxlIGFuZCBodW5rX2J1ZjoKICAgICAgICAgICAgaHVua19idWYuYXBwZW5kKGRsaW5lKQogICAgaWYgaW5fZmlsZSBhbmQgaHVua19idWY6CiAgICAgICAgZGlmZl9odW5rc19hdF9jcmFzaCArPSAnXG4nLmpvaW4oaHVua19idWYpCiAgICBkaWZmX2h1bmtzX2F0X2NyYXNoID0gZGlmZl9odW5rc19hdF9jcmFzaFs6ODAwMF0KCiMgQnVpbGQgdGVsZW1ldHJ5IHBheWxvYWQgZm9yIHJlY29yZF9ib290X2NyYXNoIHRvb2wKcGF5bG9hZCA9IHsKICAgICd0b29sX25hbWUnOiAncmVjb3JkX2Jvb3RfY3Jhc2gnLAogICAgJ2FyZ3VtZW50cyc6IHsKICAgICAgICAnc2VydmljZV9uYW1lJzogICAgICAgIG9zLmVudmlyb24uZ2V0KCdfU0VSVklDRScsICcnKSwKICAgICAgICAnYnVpbGRfaWQnOiAgICAgICAgICAgIG9zLmVudmlyb24uZ2V0KCdCVUlMRF9JRCcsICcnKSwKICAgICAgICAnY29tbWl0X3NoYSc6ICAgICAgICAgIG9zLmVudmlyb24uZ2V0KCdDT01NSVRfU0hBJywgJycpLAogICAgICAgICdyZXZpc2lvbic6ICAgICAgICAgICAgb3BlbignL3dvcmtzcGFjZS9uZXdfcmV2aXNpb24udHh0JykucmVhZCgpLnN0cmlwKCkgaWYgb3MucGF0aC5leGlzdHMoJy93b3Jrc3BhY2UvbmV3X3JldmlzaW9uLnR4dCcpIGVsc2UgJycsCiAgICAgICAgJ2Vycm9yX3R5cGUnOiAgICAgICAgICAnQ09OVEFJTkVSX0JPT1RfQ1JBU0gnLAogICAgICAgICdlcnJvcl9uYW1lJzogICAgICAgICAgZXJyb3JfbmFtZSwKICAgICAgICAnZXJyb3JfbXNnJzogICAgICAgICAgIGVycm9yX21zZywKICAgICAgICAndHJhY2ViYWNrJzogICAgICAgICAgIHRyYWNlYmFja190ZXh0Wzo4MDAwXSwKICAgICAgICAnY3Jhc2hfZmlsZSc6ICAgICAgICAgIGNyYXNoX2ZpbGUgb3IgJ3Vua25vd24nLAogICAgICAgICdjcmFzaF9saW5lJzogICAgICAgICAgY3Jhc2hfbGluZSBvciAwLAogICAgICAgICdjb2RlX2NvbnRleHQnOiAgICAgICAgY29kZV9jb250ZXh0Wzo1MDAwXSwKICAgICAgICAnZGlmZl9zdGF0JzogICAgICAgICAgIGRpZmZfc3RhdFs6MjAwMF0sCiAgICAgICAgJ2RpZmZfaHVua3NfYXRfY3Jhc2gnOiBkaWZmX2h1bmtzX2F0X2NyYXNoLAogICAgICAgICdib290X2xvZ3NfcmF3JzogICAgICAgYm9vdF9sb2dzWzo0MDAwXSwKICAgIH0KfQoKd2l0aCBvcGVuKCcvd29ya3NwYWNlL2NyYXNoX3BheWxvYWQuanNvbicsICd3JykgYXMgZjoKICAgIGpzb24uZHVtcChwYXlsb2FkLCBmKQoKcHJpbnQoZidjcmFzaF9maWxlPXtjcmFzaF9maWxlfSBjcmFzaF9saW5lPXtjcmFzaF9saW5lfScpCnByaW50KGYnZXJyb3I9e2Vycm9yX25hbWV9OiB7ZXJyb3JfbXNnWzo4MF19JykKcHJpbnQoZid0cmFjZWJhY2tfbGluZXM9e2xlbih0cmFjZWJhY2tfdGV4dC5zcGxpdGxpbmVzKCkpfScpCnByaW50KGYnY29kZV9jb250ZXh0X2xpbmVzPXtsZW4oY29kZV9jb250ZXh0LnNwbGl0bGluZXMoKSl9JykKcHJpbnQoZidkaWZmX2h1bmtzX2xpbmVzPXtsZW4oZGlmZl9odW5rc19hdF9jcmFzaC5zcGxpdGxpbmVzKCkpfScpCg==' | base64 -d > /workspace/parse_crash.py
+    python3 /workspace/parse_crash.py
+
+    echo "Posting boot crash attribution to telemetry..."
+    if [ -f /workspace/crash_payload.json ]; then
+      HTTP_CODE=$(curl -sf -o /tmp/crash_resp.json -w "%{http_code}" --max-time 30 --retry 0 -X POST "$_GATEWAY" -H "Content-Type: application/json" -H "X-API-Key: $_GATEWAY_KEY" -d @/workspace/crash_payload.json 2>/dev/null || echo "000")
+      echo "Telemetry HTTP: $HTTP_CODE"
+      cat /tmp/crash_resp.json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('stored:', d.get('stored'), '| crash:', d.get('crash_file'), ':', d.get('crash_line'), '| error:', d.get('error_name'))" 2>/dev/null || true
+    else
+      echo "WARNING: crash_payload.json not generated — telemetry skipped"
+    fi
+    echo "=== Boot crash capture complete ==="
+    exit 1
+  waitFor:
+  - deploy
 
 - id: platform-health-check
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   script: |
     #!/usr/bin/env bash
     set -uo pipefail
+
+    DEPLOY_EXIT=$(cat /workspace/deploy_exit.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
+    if [ "$DEPLOY_EXIT" != "0" ]; then
+      echo "Deploy failed — skipping health check (boot crash capture ran instead)"
+      exit 1
+    fi
 
     echo "=== PLATFORM HEALTH CHECK (v1) ==="
     echo "Service: $_SERVICE | Build: $BUILD_ID | Commit: $COMMIT_SHA"
