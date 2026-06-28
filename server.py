@@ -22,8 +22,10 @@ import asyncio
 import json
 import logging
 import os
+import re as _re
 import time
 import uuid
+from contextvars import ContextVar as _ContextVar
 from typing import Any
 
 import httpx
@@ -44,6 +46,51 @@ DB_V3_EXECUTE = f"{DB_V3_URL}/execute"
 DB_V3_HEALTH  = f"{DB_V3_URL}/health"
 API_KEY       = os.environ.get("API_KEY", "miller-techstack-2026")
 GW_VERSION    = "3.0.0"
+
+# ---------------------------------------------------------------------------
+# Enterprise header capture — UUID auto-discovery across all client types
+# (Claude native app, iPhone Safari, desktop browser, Claude Code)
+# ---------------------------------------------------------------------------
+_UUID_PATTERN = _re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    _re.I,
+)
+_upstream_hdrs: _ContextVar[dict] = _ContextVar('_upstream_hdrs', default={})
+_FORWARD_PREFIXES = (
+    'anthropic-', 'x-claude-', 'x-conversation-', 'x-chat-', 'referer', 'origin',
+)
+
+
+def _extract_uuid_from_headers(hdrs: dict) -> str | None:
+    """Scan incoming MCP request headers for a Claude conversation UUID.
+
+    Priority order: explicit conversation ID headers → Referer URL UUID.
+    Falls back to full-header scan, skipping auth/generated headers.
+    Returns lowercase UUID string or None.
+    """
+    priority_keys = [
+        'x-conversation-id', 'anthropic-conversation-id',
+        'x-claude-conversation-id', 'x-claude-chat-uuid',
+        'x-chat-id', 'referer',
+    ]
+    for k in priority_keys:
+        v = hdrs.get(k) or hdrs.get(k.lower())
+        if v:
+            m = _UUID_PATTERN.search(str(v))
+            if m:
+                return m.group(0).lower()
+    # Full-header scan — skip tokens we generated or standard auth headers
+    _skip = ('x-api-key', 'authorization', 'x-trace-id', 'x-gateway-version',
+             'content-', 'accept', 'host')
+    for k, v in hdrs.items():
+        if any(k.lower().startswith(s) for s in _skip):
+            continue
+        if v and isinstance(v, str):
+            m = _UUID_PATTERN.search(v)
+            if m:
+                return m.group(0).lower()
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Circuit Breaker
@@ -247,6 +294,13 @@ async def _proxy(tool_name: str, arguments: dict, trace_id: str) -> Any:
         "X-Gateway-Version": GW_VERSION,
         "Content-Type":      "application/json",
     }
+    # ── Forward upstream headers to db-v3 for tool-level observability ────
+    # anthropic-*, x-claude-*, x-conversation-*, referer, origin forwarded
+    # as X-Upstream-{Header} — enables future tool-level UUID extraction.
+    for _k, _v in _upstream_hdrs.get().items():
+        if any(_k.lower().startswith(_p) for _p in _FORWARD_PREFIXES):
+            _fwd_key = f'X-Upstream-{_k.replace("-", " ").title().replace(" ", "-")}'
+            headers[_fwd_key] = str(_v)[:500]
 
     t0 = time.monotonic()
     try:
@@ -371,6 +425,21 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         tool_name = inner or tool_name
         arguments = inner_args
 
+    # ── Tier 0: Auto-inject conversation UUID from gateway headers ────────
+    # When open_session arrives without a UUID (native app, iPhone, any client)
+    # check the captured MCP request headers for a conversation UUID.
+    # If found, inject it directly — session linking becomes fully automatic.
+    if tool_name == "open_session" and not (arguments or {}).get("claude_chat_uuid"):
+        _h_uuid = _extract_uuid_from_headers(_upstream_hdrs.get())
+        if _h_uuid:
+            arguments = {**(arguments or {}),
+                         "claude_chat_uuid": _h_uuid,
+                         "_uuid_source": "gateway_header"}
+            logger.info(
+                "open_session tier0_inject uuid=%s — UUID auto-wired from MCP request headers",
+                _h_uuid,
+            )
+
     try:
         # Local handlers: ping and gateway_status never leave the gateway container
         if tool_name in _LOCAL_HANDLERS:
@@ -434,6 +503,27 @@ async def _handle_single(msg: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 @app.post("/mcp")
 async def mcp_post(request: Request) -> Response:
+    # ── Enterprise header capture ─────────────────────────────────────────
+    # Capture ALL headers from every MCP call. Three purposes:
+    #   1. Discovery — log what claude.ai sends so we can find the UUID header
+    #   2. Injection — auto-wire UUID into open_session (Tier 0 discovery)
+    #   3. Forwarding — pass anthropic-/x-claude-/referer to db-v3 as X-Upstream-*
+    raw_hdrs = dict(request.headers)
+    _upstream_hdrs.set(raw_hdrs)
+    _interesting = {
+        k: v for k, v in raw_hdrs.items()
+        if any(k.lower().startswith(p) for p in (
+            'anthropic-', 'x-claude-', 'x-conversation-', 'x-chat-',
+            'referer', 'origin', 'user-agent', 'x-forwarded-for',
+        ))
+    }
+    _uuid_hit = _extract_uuid_from_headers(raw_hdrs)
+    logger.info(
+        "mcp_request all_keys=%s interesting=%s uuid_extracted=%s",
+        sorted(raw_hdrs.keys()),
+        json.dumps(_interesting, default=str)[:600],
+        _uuid_hit or "none",
+    )
     try:
         body = await request.json()
     except Exception:
