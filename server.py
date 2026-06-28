@@ -517,11 +517,15 @@ async def mcp_post(request: Request) -> Response:
             'referer', 'origin', 'user-agent', 'x-forwarded-for',
         ))
     }
+    # Explicitly capture chain-correlation headers regardless of prefix match
+    for _hk in ('baggage', 'traceparent', 'x-cloud-trace-context', 'x-anthropic-client'):
+        if _hk in raw_hdrs:
+            _interesting[_hk] = raw_hdrs[_hk]
     _uuid_hit = _extract_uuid_from_headers(raw_hdrs)
     logger.info(
         "mcp_request all_keys=%s interesting=%s uuid_extracted=%s",
         sorted(raw_hdrs.keys()),
-        json.dumps(_interesting, default=str)[:600],
+        json.dumps(_interesting, default=str)[:800],
         _uuid_hit or "none",
     )
     try:
