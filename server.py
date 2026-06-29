@@ -57,7 +57,8 @@ _UUID_PATTERN = _re.compile(
 )
 _upstream_hdrs: _ContextVar[dict] = _ContextVar('_upstream_hdrs', default={})
 _FORWARD_PREFIXES = (
-    'anthropic-', 'x-claude-', 'x-conversation-', 'x-chat-', 'referer', 'origin',
+    'anthropic-', 'x-claude-', 'x-conversation-', 'x-chat-',
+    'referer', 'origin', 'traceparent', 'baggage',
 )
 
 
@@ -439,6 +440,18 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                 "open_session tier0_inject uuid=%s — UUID auto-wired from MCP request headers",
                 _h_uuid,
             )
+
+    # ── Inject Anthropic trace_id into all tool calls ─────────────────────
+    # traceparent trace_id is stable per Claude message turn — all tool calls
+    # in one response share it. Enables platform_trace_sessions chain
+    # correlation in open_session: consecutive turns link to the same session
+    # key purely server-side. Zero client required — any device, any client.
+    _tp_val = (_upstream_hdrs.get() or {}).get('traceparent', '')
+    if _tp_val:
+        _tp_parts = _tp_val.split('-')
+        if len(_tp_parts) >= 2 and len(_tp_parts[1]) == 32:
+            arguments = {**(arguments or {}), '_anthropic_trace_id': _tp_parts[1]}
+            logger.debug("trace_id_inject trace_id=%s tool=%s", _tp_parts[1], tool_name)
 
     try:
         # Local handlers: ping and gateway_status never leave the gateway container
