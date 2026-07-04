@@ -408,10 +408,23 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
 
     # arguments may arrive as a JSON string from MCP serialization
     if isinstance(arguments, str):
+        _args_raw = arguments
         try:
             arguments = json.loads(arguments)
-        except Exception:
-            arguments = {}
+        except Exception as _exc:
+            logger.error(
+                "meta_tool outer_args parse FAILED tool=%s len=%d err=%s preview=%.300r",
+                tool_name, len(_args_raw), _exc, _args_raw,
+            )
+            return _ok(req_id, {
+                "content": [{"type": "text", "text": json.dumps({
+                    "error": f"meta_tool: arguments JSON parse failed \u2014 {_exc}",
+                    "args_len": len(_args_raw),
+                    "args_preview": _args_raw[:300],
+                    "hint": "Use bash_tool + direct POST to /execute for large payloads",
+                })}],
+                "isError": True,
+            })
 
     # meta_tool unwrapping: Claude calls meta_tool(tool_name=X, arguments={...})
     # Unwrap so the inner tool_name routes correctly through _proxy or _LOCAL_HANDLERS.
@@ -419,10 +432,24 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         inner      = arguments.get("tool_name", "")
         inner_args = arguments.get("arguments", {}) or {}
         if isinstance(inner_args, str):
+            _raw = inner_args
             try:
                 inner_args = json.loads(inner_args)
-            except Exception:
-                inner_args = {}
+            except Exception as _exc:
+                logger.error(
+                    "meta_tool inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r",
+                    inner, len(_raw), _exc, _raw,
+                )
+                return _ok(req_id, {
+                    "content": [{"type": "text", "text": json.dumps({
+                        "error": f"meta_tool: inner arguments JSON parse failed \u2014 {_exc}",
+                        "inner_tool": inner,
+                        "inner_args_len": len(_raw),
+                        "inner_args_preview": _raw[:300],
+                        "hint": "Use bash_tool + direct POST to /execute for large payloads (code= or patches=)",
+                    })}],
+                    "isError": True,
+                })
         tool_name = inner or tool_name
         arguments = inner_args
 
