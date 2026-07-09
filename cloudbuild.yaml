@@ -1,13 +1,15 @@
-# MillerMCPProxy — Cloud Build v2.0 — deploys miller-mcp-gateway
-# v2: Enterprise-grade upgrade matching MillerMCPDB v13 pattern.
-#     FIXES: wrong _SERVICE/IMAGE substitutions — was building miller-mcp-db image
-#            and deploying it into the gateway service. Gateway was running wrong code.
-#     ADDS: record-build-started, vuln-scan-gate, platform-health-check with
-#           post_deploy_health_check -> revision_registry stable tagging.
+# MillerMCPProxy — Cloud Build v3.0 — deploys miller-mcp-gateway
+# v3: Build telemetry fixed and completed.
+#     FIXES: record-build-started was calling async_repl -> platform_events (wrong tool,
+#            wrong table). Now calls record_build_span via curl — identical pattern to
+#            MillerJobWorker v2 and all other services.
+#     ADDS: record-push-complete, record-deploy-complete spans.
 #     NOTE: _GATEWAY points to miller-mcp-db direct endpoint (not the gateway itself,
 #           since the gateway IS what is being deployed).
+# v2: Enterprise-grade upgrade matching MillerMCPDB v13 pattern.
 #
-# PIPELINE: record-started -> pull-cache -> build -> push -> vuln-scan-gate -> deploy -> platform-health-check
+# PIPELINE: record-started -> pull-cache -> build -> push -> record-push ->
+#           vuln-scan-gate -> deploy -> record-deploy / capture-boot-crash -> platform-health-check
 
 substitutions:
   _SERVICE: miller-mcp-gateway
@@ -22,22 +24,12 @@ steps:
 - id: record-build-started
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   script: |
-    #!/usr/bin/env bash
-    PAYLOAD=$(python3 -c "
-    import json
-    print(json.dumps({
-      'tool_name': 'async_repl',
-      'arguments': {
-        'code': \"await db_pool.execute(\\\"INSERT INTO platform_events (event_type, entity_type, entity_name, payload, source, created_at) VALUES ('build.started', 'cloud_build', '$_SERVICE', '{}' ::jsonb, 'cloudbuild', NOW())\\\")\"
-      }
-    }))
-    ")
-    curl -sf --max-time 15 -X POST "$_GATEWAY" \
+    curl -sf --max-time 10 \
+      -X POST "$_GATEWAY" \
       -H "Content-Type: application/json" \
       -H "X-API-Key: $_GATEWAY_KEY" \
-      -d "$PAYLOAD" \
-      && echo "build.started recorded" \
-      || echo "WARNING: build.started record failed (non-blocking)"
+      -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"build_started\",\"status\":\"ok\"}}" \
+      || echo "telemetry non-blocking"
   waitFor: ['-']
 
 - id: pull-cache
@@ -75,6 +67,18 @@ steps:
   waitFor:
   - build
 
+- id: record-push-complete
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  script: |
+    curl -sf --max-time 10 \
+      -X POST "$_GATEWAY" \
+      -H "Content-Type: application/json" \
+      -H "X-API-Key: $_GATEWAY_KEY" \
+      -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"image_push_complete\",\"status\":\"ok\"}}" \
+      || echo "telemetry non-blocking"
+  waitFor:
+  - push
+
 - id: vuln-scan-gate
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   script: |
@@ -93,7 +97,7 @@ steps:
       sleep 10
     done
   waitFor:
-  - push
+  - record-push-complete
 
 - id: deploy
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
@@ -141,6 +145,20 @@ steps:
     echo "=== Deploy complete ==="
   waitFor:
   - vuln-scan-gate
+
+- id: record-deploy-complete
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  script: |
+    DEPLOY_EXIT=$(cat /workspace/deploy_exit.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
+    if [ "$DEPLOY_EXIT" = "0" ]; then DEPLOY_STATUS=ok; else DEPLOY_STATUS=error; fi
+    curl -sf --max-time 10 \
+      -X POST "$_GATEWAY" \
+      -H "Content-Type: application/json" \
+      -H "X-API-Key: $_GATEWAY_KEY" \
+      -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"deploy_complete\",\"status\":\"$DEPLOY_STATUS\"}}" \
+      || echo "telemetry non-blocking"
+  waitFor:
+  - deploy
 
 - id: capture-boot-crash
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
