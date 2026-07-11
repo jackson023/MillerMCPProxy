@@ -68,6 +68,11 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-inngest-signing-key
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-platform-api-key
         startupProbe:
           tcpSocket:
             port: 8080

@@ -17,17 +17,17 @@ substitutions:
   _REGION: us-central1
   _PROJECT: miller-iq-platform
   _GATEWAY: https://miller-mcp-db-v3-146372550543.us-central1.run.app/execute
-  _GATEWAY_KEY: miller-techstack-2026
   _ALLOYDB_INSTANCE_URI: projects/miller-iq-platform/locations/us-central1/clusters/miller-iq-prod-restored/instances/miller-iq-prod-primary
 
 steps:
 - id: record-build-started
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  secretEnv: ['PLATFORM_API_KEY']
   script: |
     curl -sf --max-time 10 \
       -X POST "$_GATEWAY" \
       -H "Content-Type: application/json" \
-      -H "X-API-Key: $_GATEWAY_KEY" \
+      -H "X-API-Key: $$PLATFORM_API_KEY" \
       -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"build_started\",\"status\":\"ok\"}}" \
       || echo "telemetry non-blocking"
   waitFor: ['-']
@@ -69,11 +69,12 @@ steps:
 
 - id: record-push-complete
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  secretEnv: ['PLATFORM_API_KEY']
   script: |
     curl -sf --max-time 10 \
       -X POST "$_GATEWAY" \
       -H "Content-Type: application/json" \
-      -H "X-API-Key: $_GATEWAY_KEY" \
+      -H "X-API-Key: $$PLATFORM_API_KEY" \
       -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"image_push_complete\",\"status\":\"ok\"}}" \
       || echo "telemetry non-blocking"
   waitFor:
@@ -148,13 +149,14 @@ steps:
 
 - id: record-deploy-complete
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  secretEnv: ['PLATFORM_API_KEY']
   script: |
     DEPLOY_EXIT=$(cat /workspace/deploy_exit.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
     if [ "$DEPLOY_EXIT" = "0" ]; then DEPLOY_STATUS=ok; else DEPLOY_STATUS=error; fi
     curl -sf --max-time 10 \
       -X POST "$_GATEWAY" \
       -H "Content-Type: application/json" \
-      -H "X-API-Key: $_GATEWAY_KEY" \
+      -H "X-API-Key: $$PLATFORM_API_KEY" \
       -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"deploy_complete\",\"status\":\"$DEPLOY_STATUS\"}}" \
       || echo "telemetry non-blocking"
   waitFor:
@@ -163,6 +165,7 @@ steps:
 - id: capture-boot-crash
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   allowFailure: false
+  secretEnv: ['PLATFORM_API_KEY']
   script: |
     #!/usr/bin/env bash
     set -uo pipefail
@@ -203,7 +206,7 @@ steps:
 
     echo "Posting boot crash attribution to telemetry..."
     if [ -f /workspace/crash_payload.json ]; then
-      HTTP_CODE=$(curl -sf -o /tmp/crash_resp.json -w "%{http_code}" --max-time 30 --retry 0 -X POST "$_GATEWAY" -H "Content-Type: application/json" -H "X-API-Key: $_GATEWAY_KEY" -d @/workspace/crash_payload.json 2>/dev/null || echo "000")
+      HTTP_CODE=$(curl -sf -o /tmp/crash_resp.json -w "%{http_code}" --max-time 30 --retry 0 -X POST "$_GATEWAY" -H "Content-Type: application/json" -H "X-API-Key: $$PLATFORM_API_KEY" -d @/workspace/crash_payload.json 2>/dev/null || echo "000")
       echo "Telemetry HTTP: $HTTP_CODE"
       cat /tmp/crash_resp.json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('stored:', d.get('stored'), '| crash:', d.get('crash_file'), ':', d.get('crash_line'), '| error:', d.get('error_name'))" 2>/dev/null || true
     else
@@ -216,6 +219,7 @@ steps:
 
 - id: platform-health-check
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  secretEnv: ['PLATFORM_API_KEY']
   script: |
     #!/usr/bin/env bash
     set -uo pipefail
@@ -257,7 +261,7 @@ steps:
         --retry 0 \
         -X POST "$_GATEWAY" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $_GATEWAY_KEY" \
+        -H "X-API-Key: $$PLATFORM_API_KEY" \
         -d "$PAYLOAD" 2>/dev/null || echo "000")
 
       echo "HTTP status: $HTTP_CODE"
@@ -333,6 +337,11 @@ images:
 - $_IMAGE:latest
 
 logsBucket: 'gs://miller-iq-platform_cloudbuild'
+
+availableSecrets:
+  secretManager:
+  - versionName: projects/miller-iq-platform/secrets/miller-platform-api-key/versions/latest
+    env: PLATFORM_API_KEY
 
 options:
   dynamicSubstitutions: true
