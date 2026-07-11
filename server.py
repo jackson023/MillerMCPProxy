@@ -44,7 +44,7 @@ logger = logging.getLogger("miller-mcp-gateway")
 DB_V3_URL     = os.environ.get("DB_V3_URL", "https://miller-mcp-db-v3-irj2rlhsea-uc.a.run.app")
 DB_V3_EXECUTE = f"{DB_V3_URL}/execute"
 DB_V3_HEALTH  = f"{DB_V3_URL}/health"
-API_KEY       = os.environ.get("API_KEY", "miller-techstack-2026")
+API_KEY       = os.environ.get("API_KEY", "")  # Required — set via Cloud Run env var. No hardcoded fallback.
 GW_VERSION    = "3.0.0"
 
 # ---------------------------------------------------------------------------
