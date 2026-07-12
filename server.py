@@ -487,6 +487,18 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         else:
             result = await _proxy(tool_name, arguments, trace_id)
 
+        # ── Inline image extraction ───────────────────────────────────────────────────
+        # Tools may return _inline_image_b64 + _inline_image_mime to embed an
+        # image directly in the MCP tool result so Claude sees it without a
+        # separate curl+view step. Extract before JSON serialisation so the
+        # b64 blob does not bloat the text block.
+        inline_image_b64  = None
+        inline_image_mime = 'image/png'
+        if isinstance(result, dict) and result.get('_inline_image_b64'):
+            result            = dict(result)           # shallow copy — never mutate original
+            inline_image_b64  = result.pop('_inline_image_b64')
+            inline_image_mime = result.pop('_inline_image_mime', 'image/png')
+
         if isinstance(result, (dict, list)):
             text = json.dumps(result, default=str)
         elif result is None:
@@ -494,7 +506,15 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         else:
             text = str(result)
 
-        return _ok(req_id, {"content": [{"type": "text", "text": text}]})
+        content_blocks = [{"type": "text", "text": text}]
+        if inline_image_b64:
+            content_blocks.append({
+                "type":     "image",
+                "data":     inline_image_b64,
+                "mimeType": inline_image_mime,
+            })
+
+        return _ok(req_id, {"content": content_blocks})
 
     except Exception as exc:
         logger.error(
