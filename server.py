@@ -492,12 +492,25 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         # image directly in the MCP tool result so Claude sees it without a
         # separate curl+view step. Extract before JSON serialisation so the
         # b64 blob does not bloat the text block.
+        #
+        # db-v3 /execute wraps tool responses as {"status":"ok","result":{...}}.
+        # _inline_image_b64 lives inside result["result"], not at the top level.
+        # We check both levels to be forward-compatible with any response shape.
         inline_image_b64  = None
         inline_image_mime = 'image/png'
-        if isinstance(result, dict) and result.get('_inline_image_b64'):
-            result            = dict(result)           # shallow copy — never mutate original
-            inline_image_b64  = result.pop('_inline_image_b64')
-            inline_image_mime = result.pop('_inline_image_mime', 'image/png')
+        if isinstance(result, dict):
+            if result.get('_inline_image_b64'):
+                # Top-level shape (local handlers or future tools)
+                result            = dict(result)           # shallow copy — never mutate original
+                inline_image_b64  = result.pop('_inline_image_b64')
+                inline_image_mime = result.pop('_inline_image_mime', 'image/png')
+            elif isinstance(result.get('result'), dict) and result['result'].get('_inline_image_b64'):
+                # Wrapped shape: db-v3 /execute — {"status":"ok","result":{...,_inline_image_b64,...}}
+                _inner            = dict(result['result'])  # shallow copy inner — never mutate
+                inline_image_b64  = _inner.pop('_inline_image_b64')
+                inline_image_mime = _inner.pop('_inline_image_mime', 'image/png')
+                result            = dict(result)            # shallow copy outer
+                result['result']  = _inner
 
         if isinstance(result, (dict, list)):
             text = json.dumps(result, default=str)
