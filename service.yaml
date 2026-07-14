@@ -25,7 +25,7 @@ spec:
         run.googleapis.com/container-dependencies: '{"app":["alloydb-proxy"]}'
         run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
         run.googleapis.com/startup-cpu-boost: 'true'
-        run.googleapis.com/vpc-access-egress: private-ranges-only
+        run.googleapis.com/vpc-access-egress: all-traffic
       labels:
         run.googleapis.com/startupProbeType: Default
     spec:
