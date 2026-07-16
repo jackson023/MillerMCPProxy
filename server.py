@@ -378,6 +378,23 @@ async def _startup() -> None:
 # ---------------------------------------------------------------------------
 # JSON-RPC helpers
 # ---------------------------------------------------------------------------
+def _sanitize_json_escapes(s: str) -> str:
+    """Strip invalid JSON escape sequences before json.loads/raw_decode.
+
+    JSON only allows: \\\", \\\\, \\/, \\b, \\f, \\n, \\r, \\t, \\uXXXX.
+    Python-style \\' (and any other \\X where X is not a valid JSON escape)
+    causes json.loads to throw. Strip the backslash — \\' becomes ', which
+    is the intent. This is safe: single quotes never need escaping in JSON.
+
+    S1171: enterprise fix — eliminates the 'meta_tool: inner arguments JSON
+    parse failed' failure mode that occurred when Claude constructed patch
+    strings with Python-style quoting.
+    """
+    import re as _re_sj
+    # Strip \ not followed by a valid JSON escape char
+    return _re_sj.sub(r'\\(?!["\\\'/bfnrtu0-9])', '', s)
+
+
 def _ok(req_id: Any, result: Any) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
@@ -410,7 +427,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     if isinstance(arguments, str):
         _args_raw = arguments
         try:
-            arguments, _ = json.JSONDecoder().raw_decode(arguments.strip())
+            arguments, _ = json.JSONDecoder().raw_decode(_sanitize_json_escapes(arguments.strip()))
         except Exception as _exc:
             logger.error(
                 "meta_tool outer_args parse FAILED tool=%s len=%d err=%s preview=%.300r",
@@ -421,7 +438,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                     "error": f"meta_tool: arguments JSON parse failed \u2014 {_exc}",
                     "args_len": len(_args_raw),
                     "args_preview": _args_raw[:300],
-                    "hint": "Use bash_tool + direct POST to /execute for large payloads",
+                    "hint": "Use lines=N-M mode for old_str + b64: prefix for new_str. Never construct JSON strings manually with Python-style escapes.",
                 })}],
                 "isError": True,
             })
@@ -434,7 +451,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         if isinstance(inner_args, str):
             _raw = inner_args
             try:
-                inner_args, _ = json.JSONDecoder().raw_decode(inner_args.strip())
+                inner_args, _ = json.JSONDecoder().raw_decode(_sanitize_json_escapes(inner_args.strip()))
             except Exception as _exc:
                 logger.error(
                     "meta_tool inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r",
@@ -446,7 +463,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                         "inner_tool": inner,
                         "inner_args_len": len(_raw),
                         "inner_args_preview": _raw[:300],
-                        "hint": "Use bash_tool + direct POST to /execute for large payloads (code= or patches=)",
+                        "hint": "Use lines=N-M mode for old_str (derives from source, zero encoding) + b64: prefix for new_str. Never pass JSON strings with Python-style escapes.",
                     })}],
                     "isError": True,
                 })
