@@ -18,6 +18,23 @@ Components:
   /execute        — REST passthrough, proxies to db-v3 /execute
 """
 
+# ==============================================================================
+# server.py -- miller-mcp-gateway  |  NAVIGATION INDEX
+# grep: "# == § " to list all section headers  |  679 lines
+# ==============================================================================
+# § 001  Imports
+# § 002  Logging
+# § 003  Config (DB_V3_URL, API_KEY, GW_VERSION)
+# § 004  UUID Discovery -- header scan for Claude conversation UUID auto-wiring
+# § 005  Circuit Breaker (5 failures -> open 30s -> half-open probe)
+# § 006  Static Bootstrap Tools (meta_tool, ping, gateway_status -- zero I/O)
+# § 007  Local Tool Handlers (ping, gateway_status -- never leave container)
+# § 008  Proxy (_proxy -> db-v3 /execute, circuit-breaker wrapped)
+# § 009  FastAPI App + Startup probe
+# § 010  JSON-RPC Helpers (_sanitize_json_escapes, _ok, _err)
+# § 011  MCP Method Handlers (_handle_initialize, tools/list, tools/call)
+# § 012  Routes (/mcp POST, /mcp GET, /execute passthrough, /health)
+# ==============================================================================
 import asyncio
 import json
 import logging
@@ -32,12 +49,16 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+# == § 002  LOGGING ===========================================================
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("miller-mcp-gateway")
 
+# == § 003  CONFIG =============================================================
+# DB_V3_URL: primary service URL (irj2rlhsea variant for Jidoka intercept).
+# API_KEY: required, set via Cloud Run env var -- no hardcoded fallback.
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -47,6 +68,11 @@ DB_V3_HEALTH  = f"{DB_V3_URL}/health"
 API_KEY       = os.environ.get("API_KEY", "")  # Required — set via Cloud Run env var. No hardcoded fallback.
 GW_VERSION    = "3.0.0"
 
+# == § 004  UUID DISCOVERY =====================================================
+# _extract_uuid_from_headers: scans incoming MCP headers for Claude UUID.
+# Priority: explicit conversation ID headers -> Referer URL -> full scan.
+# Used by Tier 0 auto-injection in open_session (zero client required).
+# _upstream_hdrs ContextVar: captures ALL headers per MCP call for forwarding.
 # ---------------------------------------------------------------------------
 # Enterprise header capture — UUID auto-discovery across all client types
 # (Claude native app, iPhone Safari, desktop browser, Claude Code)
@@ -93,6 +119,10 @@ def _extract_uuid_from_headers(hdrs: dict) -> str | None:
     return None
 
 
+# == § 005  CIRCUIT BREAKER ====================================================
+# Three states: closed (normal) -> open (5 consecutive 5xx/timeout) -> half-open.
+# open: fail fast, no calls to db-v3. half-open after 30s: one probe allowed.
+# Auth failures (401) do NOT penalize the circuit -- config problem, not health.
 # ---------------------------------------------------------------------------
 # Circuit Breaker
 # ---------------------------------------------------------------------------
@@ -171,6 +201,10 @@ class CircuitBreaker:
 
 _circuit = CircuitBreaker()
 
+# == § 006  STATIC BOOTSTRAP TOOLS ============================================
+# Served from tools/list with zero I/O -- no DB, no network, no latency.
+# Only 3 tools registered at the MCP layer: meta_tool, ping, gateway_status.
+# meta_tool routes all 1,954 platform tools via single unwrapping dispatch.
 # ---------------------------------------------------------------------------
 # Static bootstrap tool definitions
 # Served from tools/list with zero I/O — no DB, no network, no latency.
@@ -217,6 +251,9 @@ _BOOTSTRAP_TOOLS = [
     },
 ]
 
+# == § 007  LOCAL TOOL HANDLERS ================================================
+# ping and gateway_status are handled entirely inside the gateway container.
+# gateway_status probes db-v3 /health and returns full diagnostic state.
 # ---------------------------------------------------------------------------
 # Local tool handlers — never leave the gateway container
 # ---------------------------------------------------------------------------
@@ -272,6 +309,11 @@ _LOCAL_HANDLERS: dict[str, Any] = {
     "gateway_status": _handle_gateway_status,
 }
 
+# == § 008  PROXY (_proxy) =====================================================
+# Every non-local tool call proxies to db-v3 /execute via _proxy().
+# Circuit breaker wraps every call. 120s timeout (5s connect).
+# Auth failure (401) -> config error, not circuit penalized.
+# 5xx/timeout -> circuit failure recorded, potential OPEN state.
 # ---------------------------------------------------------------------------
 # Proxy — forward tool call to db-v3 /execute
 # ---------------------------------------------------------------------------
@@ -354,6 +396,9 @@ async def _proxy(tool_name: str, arguments: dict, trace_id: str) -> Any:
         raise RuntimeError(f"db-v3 unreachable: {exc}") from exc
 
 
+# == § 009  FASTAPI APP + STARTUP ==============================================
+# Startup probe: non-circuit-breaker check of db-v3 /health at boot.
+# Logs reachability but does NOT affect circuit state on failure.
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -375,6 +420,10 @@ async def _startup() -> None:
         logger.warning("Startup probe → db-v3 unreachable (non-fatal): %s", exc)
 
 
+# == § 010  JSON-RPC HELPERS ===================================================
+# _sanitize_json_escapes: strips invalid escapes (e.g. \' from Python patches)
+# before json.loads -- eliminates 'inner arguments JSON parse failed' errors.
+# S1171: enterprise fix for Claude-constructed patch strings.
 # ---------------------------------------------------------------------------
 # JSON-RPC helpers
 # ---------------------------------------------------------------------------
@@ -402,6 +451,12 @@ def _err(req_id: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+# == § 011  MCP METHOD HANDLERS ================================================
+# _handle_initialize: returns protocolVersion 2025-03-26 + capabilities.
+# _handle_tools_list: returns _BOOTSTRAP_TOOLS static defs, zero I/O.
+# _handle_tools_call: unwraps meta_tool, Tier 0 UUID inject, traceparent
+#   inject, local handler dispatch or _proxy, inline image extraction.
+# _handle_single: routes JSON-RPC method to correct handler.
 # ---------------------------------------------------------------------------
 # MCP method handlers
 # ---------------------------------------------------------------------------
@@ -588,6 +643,13 @@ async def _handle_single(msg: dict) -> dict | None:
         return _err(req_id, -32603, f"Internal error: {exc}")
 
 
+# == § 012  ROUTES =============================================================
+# POST /mcp: main MCP endpoint. Captures all headers into _upstream_hdrs.
+#   Handles batch (list) and single JSON-RPC. Returns 202 for notifications.
+# GET  /mcp: 405 (MCP is POST-only).
+# POST /execute: REST passthrough to db-v3 /execute. X-API-Key auth.
+# GET  /health: local gateway health. No I/O, no AlloyDB dependency.
+#   Use gateway_status tool for full db-v3 reachability diagnostics.
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
