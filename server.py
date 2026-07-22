@@ -482,7 +482,10 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     if isinstance(arguments, str):
         _args_raw = arguments
         try:
-            arguments, _ = json.JSONDecoder().raw_decode(_sanitize_json_escapes(arguments.strip()))
+            try:
+                arguments = json.loads(arguments.strip())
+            except Exception:
+                arguments = json.loads(_sanitize_json_escapes(arguments.strip()))
         except Exception as _exc:
             logger.error(
                 "meta_tool outer_args parse FAILED tool=%s len=%d err=%s preview=%.300r",
@@ -506,7 +509,10 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         if isinstance(inner_args, str):
             _raw = inner_args
             try:
-                inner_args, _ = json.JSONDecoder().raw_decode(_sanitize_json_escapes(inner_args.strip()))
+                try:
+                    inner_args = json.loads(inner_args.strip())
+                except Exception:
+                    inner_args = json.loads(_sanitize_json_escapes(inner_args.strip()))
             except Exception as _exc:
                 logger.error(
                     "meta_tool inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r",
