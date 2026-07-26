@@ -754,6 +754,37 @@ async def mcp_get() -> Response:
     return Response(status_code=405)
 
 
+def _unwrap_meta_tool_rest(tool_name: str, arguments: Any) -> tuple[str, dict, str | None]:
+    if tool_name != "meta_tool":
+        return tool_name, (arguments or {}), None
+    if not isinstance(arguments, dict):
+        return tool_name, {}, f"meta_tool arguments must be an object, got {type(arguments).__name__}"
+    _expected_keys = {"tool_name", "arguments"}
+    _unexpected = set(arguments.keys()) - _expected_keys
+    if _unexpected:
+        _bad = sorted(_unexpected)
+        logger.error("meta_tool(rest) shape_violation unexpected_keys=%s tool=%s", _bad, arguments.get("tool_name", "?"))
+        return tool_name, {}, (
+            "meta_tool called with unexpected top-level argument(s): " + str(_bad) +
+            ". Nest all target-tool fields inside arguments instead of passing them as siblings of tool_name."
+        )
+    inner = arguments.get("tool_name", "")
+    inner_args = arguments.get("arguments", {}) or {}
+    if isinstance(inner_args, str):
+        _raw = inner_args
+        if len(_raw) > _LARGE_PAYLOAD_THRESHOLD:
+            return tool_name, {}, f"BLOCKED: payload too large for meta_tool inline JSON argument transport ({len(_raw)} chars, threshold {_LARGE_PAYLOAD_THRESHOLD} chars)"
+        try:
+            try:
+                inner_args = json.loads(inner_args.strip())
+            except Exception:
+                inner_args = json.loads(_sanitize_json_escapes(inner_args.strip()))
+        except Exception as _exc:
+            logger.error("meta_tool(rest) inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r", inner, len(_raw), _exc, _raw)
+            return tool_name, {}, f"meta_tool: inner arguments JSON parse failed: {_exc}"
+    return (inner or tool_name), (inner_args or {}), None
+
+
 @app.post("/execute")
 async def rest_execute(request: Request) -> Response:
     """
@@ -771,6 +802,9 @@ async def rest_execute(request: Request) -> Response:
     arguments = body.get("arguments", {}) or {}
     if not tool_name:
         return JSONResponse(status_code=400, content={"error": "tool_name required"})
+    tool_name, arguments, _unwrap_err = _unwrap_meta_tool_rest(tool_name, arguments)
+    if _unwrap_err:
+        return JSONResponse(status_code=400, content={"error": _unwrap_err})
     trace_id = str(uuid.uuid4())
     try:
         result = await _proxy(tool_name, arguments, trace_id)
