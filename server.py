@@ -451,6 +451,39 @@ def _err(req_id: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+# S1220: proactive block for oversized inline string arguments -- meta_tool's JSON
+# argument transport does not reliably ERROR on large payloads, it can silently
+# CORRUPT them instead (the sanitizer above strips backslashes it should not),
+# so a payload that happens to parse at this size still cannot be trusted.
+# Blocking above a safe threshold, before ever attempting json.loads, is the
+# only trustworthy behavior. platform_publish has a matching *_gcs_url sibling
+# for every content-heavy parameter -- that is the correct, reliable path.
+_LARGE_PAYLOAD_THRESHOLD = 3000  # chars, raw string length before any parsing
+
+
+def _large_payload_block(req_id: Any, raw_len: int, tool_name: str) -> dict:
+    return _ok(req_id, {
+        "content": [{"type": "text", "text": json.dumps({
+            "error": "BLOCKED: payload too large for meta_tool's inline JSON argument transport.",
+            "size_chars": raw_len,
+            "threshold_chars": _LARGE_PAYLOAD_THRESHOLD,
+            "tool": tool_name,
+            "fix": (
+                "Do not retry with base64, manual re-escaping, or any other inline workaround -- "
+                "this transport is unreliable above the threshold regardless of encoding. Instead: "
+                "(1) write the content to a file with bash_tool; "
+                "(2) upload it via curl -X POST https://miller-mcp-db-v3-146372550543.us-central1.run.app/platform/upload "
+                "-H 'X-API-Key: <key>' -H 'X-Upload-Filename: <name>' -H 'X-Upload-Folder: <folder>' --data-binary @file; "
+                "(3) pass the matching *_gcs_url parameter to platform_publish instead of the inline field: "
+                "code_gcs_url (for code=), js_gcs_url (for js=), sql_gcs_url (for sql=), html_gcs_url (for html=), "
+                "patches_gcs_url (for patches=), yaml_gcs_url, jinja_gcs_url, shell_gcs_url. "
+                "platform_publish fetches the content server-side -- the large blob never touches this transport."
+            ),
+        })}],
+        "isError": True,
+    })
+
+
 # == § 011  MCP METHOD HANDLERS ================================================
 # _handle_initialize: returns protocolVersion 2025-03-26 + capabilities.
 # _handle_tools_list: returns _BOOTSTRAP_TOOLS static defs, zero I/O.
@@ -481,6 +514,8 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     # arguments may arrive as a JSON string from MCP serialization
     if isinstance(arguments, str):
         _args_raw = arguments
+        if len(_args_raw) > _LARGE_PAYLOAD_THRESHOLD:
+            return _large_payload_block(req_id, len(_args_raw), tool_name)
         try:
             try:
                 arguments = json.loads(arguments.strip())
@@ -508,6 +543,8 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         inner_args = arguments.get("arguments", {}) or {}
         if isinstance(inner_args, str):
             _raw = inner_args
+            if len(_raw) > _LARGE_PAYLOAD_THRESHOLD:
+                return _large_payload_block(req_id, len(_raw), inner or tool_name)
             try:
                 try:
                     inner_args = json.loads(inner_args.strip())
