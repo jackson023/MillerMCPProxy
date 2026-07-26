@@ -510,7 +510,6 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
     trace_id  = str(uuid.uuid4())
-    logger.info("S1226E_GWDEBUG raw_name=%r name_type=%s params_keys=%s arg_type=%s arg_repr=%.300r", tool_name, type(tool_name).__name__, sorted(params.keys()), type(arguments).__name__, arguments)
 
     # arguments may arrive as a JSON string from MCP serialization
     if isinstance(arguments, str):
@@ -539,7 +538,17 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
 
     # meta_tool unwrapping: Claude calls meta_tool(tool_name=X, arguments={...})
     # Unwrap so the inner tool_name routes correctly through _proxy or _LOCAL_HANDLERS.
-    if tool_name == "meta_tool":
+    _unwrap_depth = 0
+    while tool_name == "meta_tool" and _unwrap_depth < 5:
+        _unwrap_depth += 1
+        # S1226E: looped unwrap (was a single "if") -- live debug logging confirmed
+        # the wire payload can carry an extra redundant meta_tool wrapping layer
+        # beyond the one this handler's own schema anticipates (client-side
+        # transport artifact: params.arguments == {tool_name:'meta_tool',
+        # arguments:{tool_name:X, arguments:{...}}}), so a single unwrap pass left
+        # tool_name=='meta_tool' with one more nested layer still inside arguments.
+        # Looping (bounded, depth<5) resolves any number of wrapping layers to the
+        # real target tool; malformed/cyclic input still terminates via the cap.
         # S1224: enforce meta_tool's own schema before any string parsing.
         # Root cause of a real incident: a caller passed target-tool fields
         # as flat siblings of tool_name instead of nesting them under
@@ -756,34 +765,40 @@ async def mcp_get() -> Response:
 
 
 def _unwrap_meta_tool_rest(tool_name: str, arguments: Any) -> tuple[str, dict, str | None]:
-    if tool_name != "meta_tool":
-        return tool_name, (arguments or {}), None
-    if not isinstance(arguments, dict):
-        return tool_name, {}, f"meta_tool arguments must be an object, got {type(arguments).__name__}"
-    _expected_keys = {"tool_name", "arguments"}
-    _unexpected = set(arguments.keys()) - _expected_keys
-    if _unexpected:
-        _bad = sorted(_unexpected)
-        logger.error("meta_tool(rest) shape_violation unexpected_keys=%s tool=%s", _bad, arguments.get("tool_name", "?"))
-        return tool_name, {}, (
-            "meta_tool called with unexpected top-level argument(s): " + str(_bad) +
-            ". Nest all target-tool fields inside arguments instead of passing them as siblings of tool_name."
-        )
-    inner = arguments.get("tool_name", "")
-    inner_args = arguments.get("arguments", {}) or {}
-    if isinstance(inner_args, str):
-        _raw = inner_args
-        if len(_raw) > _LARGE_PAYLOAD_THRESHOLD:
-            return tool_name, {}, f"BLOCKED: payload too large for meta_tool inline JSON argument transport ({len(_raw)} chars, threshold {_LARGE_PAYLOAD_THRESHOLD} chars)"
-        try:
+    # S1226E: looped unwrap -- see matching comment in _handle_tools_call. The
+    # wire payload can carry more than one redundant meta_tool wrapping layer,
+    # so this must loop (bounded, depth<5) rather than unwrap once.
+    _depth = 0
+    while tool_name == "meta_tool" and _depth < 5:
+        _depth += 1
+        if not isinstance(arguments, dict):
+            return tool_name, {}, f"meta_tool arguments must be an object, got {type(arguments).__name__}"
+        _expected_keys = {"tool_name", "arguments"}
+        _unexpected = set(arguments.keys()) - _expected_keys
+        if _unexpected:
+            _bad = sorted(_unexpected)
+            logger.error("meta_tool(rest) shape_violation unexpected_keys=%s tool=%s", _bad, arguments.get("tool_name", "?"))
+            return tool_name, {}, (
+                "meta_tool called with unexpected top-level argument(s): " + str(_bad) +
+                ". Nest all target-tool fields inside arguments instead of passing them as siblings of tool_name."
+            )
+        inner = arguments.get("tool_name", "")
+        inner_args = arguments.get("arguments", {}) or {}
+        if isinstance(inner_args, str):
+            _raw = inner_args
+            if len(_raw) > _LARGE_PAYLOAD_THRESHOLD:
+                return tool_name, {}, f"BLOCKED: payload too large for meta_tool inline JSON argument transport ({len(_raw)} chars, threshold {_LARGE_PAYLOAD_THRESHOLD} chars)"
             try:
-                inner_args = json.loads(inner_args.strip())
-            except Exception:
-                inner_args = json.loads(_sanitize_json_escapes(inner_args.strip()))
-        except Exception as _exc:
-            logger.error("meta_tool(rest) inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r", inner, len(_raw), _exc, _raw)
-            return tool_name, {}, f"meta_tool: inner arguments JSON parse failed: {_exc}"
-    return (inner or tool_name), (inner_args or {}), None
+                try:
+                    inner_args = json.loads(inner_args.strip())
+                except Exception:
+                    inner_args = json.loads(_sanitize_json_escapes(inner_args.strip()))
+            except Exception as _exc:
+                logger.error("meta_tool(rest) inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r", inner, len(_raw), _exc, _raw)
+                return tool_name, {}, f"meta_tool: inner arguments JSON parse failed: {_exc}"
+        tool_name = inner or tool_name
+        arguments = inner_args or {}
+    return tool_name, (arguments or {}), None
 
 
 @app.post("/execute")
