@@ -539,6 +539,21 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     # meta_tool unwrapping: Claude calls meta_tool(tool_name=X, arguments={...})
     # Unwrap so the inner tool_name routes correctly through _proxy or _LOCAL_HANDLERS.
     if tool_name == "meta_tool":
+        # S1224: enforce meta_tool's own schema before any string parsing.
+        # Root cause of a real incident: a caller passed target-tool fields
+        # as flat siblings of tool_name instead of nesting them under
+        # 'arguments'. That shape error used to fall through into the
+        # STRING-parsing branch below and get misdiagnosed with the
+        # escaping/b64 hint -- a hint for a different failure class, which
+        # steered the caller toward the wrong fix. Catching it here, before
+        # any parsing, means it is always named correctly.
+        _expected_keys = set(["tool_name", "arguments"])
+        _unexpected = set(arguments.keys()) - _expected_keys
+        if _unexpected:
+            _bad = sorted(_unexpected)
+            logger.error("meta_tool shape_violation unexpected_keys=%s tool=%s", _bad, arguments.get("tool_name", "?"))
+            _msg = "meta_tool called with unexpected top-level argument(s): " + str(_bad) + ". Nest all target-tool fields inside arguments instead of passing them as siblings of tool_name."
+            return _ok(req_id, {"content": [{"type": "text", "text": json.dumps({"error": _msg, "received_top_level_keys": sorted(arguments.keys())})}], "isError": True})
         inner      = arguments.get("tool_name", "")
         inner_args = arguments.get("arguments", {}) or {}
         if isinstance(inner_args, str):
