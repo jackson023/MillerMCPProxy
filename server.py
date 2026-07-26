@@ -510,6 +510,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
     trace_id  = str(uuid.uuid4())
+    logger.info("S1226E_GWDEBUG raw_name=%r name_type=%s params_keys=%s arg_type=%s arg_repr=%.300r", tool_name, type(tool_name).__name__, sorted(params.keys()), type(arguments).__name__, arguments)
 
     # arguments may arrive as a JSON string from MCP serialization
     if isinstance(arguments, str):
