@@ -620,6 +620,38 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             arguments = {**(arguments or {}), '_anthropic_trace_id': _tp_parts[1]}
             logger.debug("trace_id_inject trace_id=%s tool=%s", _tp_parts[1], tool_name)
 
+    # S1353: Gate 35 -- mandatory GCS staging for write-path tools, Claude Chat / agent
+    # calls only. Internal server-side _dispatch() calls never reach this gateway file at
+    # all (in-process function call, no HTTP hop, no JSON serialization boundary) so this
+    # check is structurally scoped to exactly the traffic that can hit the S1220 transport
+    # bug -- it cannot slow down or break internal automation. Unconditional: no force=True
+    # bypass, no size threshold to estimate. One path, every time, for this traffic class.
+    _STAGING_REQUIRED_TOOLS = {"platform_publish", "platform_learn", "pi_publish"}
+    _STAGING_REQUIRED_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
+    if tool_name in _STAGING_REQUIRED_TOOLS and isinstance(arguments, dict):
+        _g35_hits = [f for f in _STAGING_REQUIRED_FIELDS if arguments.get(f)]
+        if _g35_hits:
+            logger.info(
+                "gate35_staging_required tool=%s fields=%s trace=%s",
+                tool_name, _g35_hits, trace_id,
+            )
+            return _ok(req_id, {
+                "content": [{"type": "text", "text": json.dumps({
+                    "error": (
+                        f"BLOCKED: {tool_name} requires GCS staging for {_g35_hits} -- "
+                        f"inline not accepted, regardless of size."
+                    ),
+                    "fields": _g35_hits,
+                    "fix": (
+                        "Stage via POST /platform/upload (X-Upload-Filename ending .txt, "
+                        "Content-Type: text/plain), then pass the matching *_gcs_url param "
+                        "instead: code_gcs_url, patches_gcs_url, sql_gcs_url, js_gcs_url, "
+                        "yaml_gcs_url, jinja_gcs_url, shell_gcs_url, html_gcs_url, content_gcs_url."
+                    ),
+                })}],
+                "isError": True,
+            })
+
     try:
         # Local handlers: ping and gateway_status never leave the gateway container
         if tool_name in _LOCAL_HANDLERS:
