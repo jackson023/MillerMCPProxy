@@ -66,7 +66,9 @@ DB_V3_URL     = os.environ.get("DB_V3_URL", "https://miller-mcp-db-v3-irj2rlhsea
 DB_V3_EXECUTE = f"{DB_V3_URL}/execute"
 DB_V3_HEALTH  = f"{DB_V3_URL}/health"
 API_KEY       = os.environ.get("API_KEY", "")  # Required — set via Cloud Run env var. No hardcoded fallback.
-GW_VERSION    = "3.0.0"
+GW_VERSION          = "3.1.0"
+GCLOUD_RUNNER_URL   = os.environ.get("GCLOUD_RUNNER_URL", "https://miller-gcloud-runner-146372550543.us-central1.run.app")
+GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
 
 # == § 004  UUID DISCOVERY =====================================================
 # _extract_uuid_from_headers: scans incoming MCP headers for Claude UUID.
@@ -249,6 +251,25 @@ _BOOTSTRAP_TOOLS = [
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "restart_service",
+        "description": (
+            "Emergency restart for a Cloud Run service via miller-gcloud-runner. "
+            "Gateway-local — never touches db-v3, always available even when db-v3 is blocked. "
+            "Use when db-v3 is frozen and meta_tool calls are timing out. "
+            "Allowed: miller-mcp-db-v3, miller-playwright-mcp, miller-gcloud-runner."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "Cloud Run service name to restart (default: miller-mcp-db-v3)",
+                    "default": "miller-mcp-db-v3",
+                },
+            },
+        },
+    },
 ]
 
 # == § 007  LOCAL TOOL HANDLERS ================================================
@@ -304,9 +325,52 @@ async def _handle_gateway_status(_args: dict) -> dict:
     }
 
 
+# Services permitted to be restarted via the watchdog endpoint.
+# Explicit allowlist -- never allow arbitrary service names.
+_RESTARTABLE_SERVICES = {"miller-mcp-db-v3", "miller-playwright-mcp", "miller-gcloud-runner"}
+
+
+async def _handle_restart_service(args: dict) -> dict:
+    """
+    Restart a Cloud Run service via miller-gcloud-runner.
+    Gateway-local -- no db-v3 in the call chain, always reachable.
+    Injects RESTART_TS env var to force a new revision without code changes.
+    """
+    service = (args.get("service") or "miller-mcp-db-v3").strip()
+    if service not in _RESTARTABLE_SERVICES:
+        return {
+            "status": "error",
+            "error": f"'{service}' not in restart allowlist: {sorted(_RESTARTABLE_SERVICES)}",
+        }
+    ts = int(time.time())
+    command = (
+        f"gcloud run services update {service}"
+        f" --update-env-vars=RESTART_TS={ts}"
+        f" --region=us-central1"
+        f" --project=miller-iq-platform"
+    )
+    logger.info("restart_service initiating service=%s ts=%d", service, ts)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=5.0)) as client:
+            r = await client.post(
+                GCLOUD_RUNNER_EXEC,
+                json={"tool_name": "run_gcloud", "arguments": {"command": command, "timeout": 75}},
+                headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+            )
+        if r.status_code == 200:
+            logger.info("restart_service OK service=%s", service)
+            return {"status": "ok", "service": service, "initiated": True, "result": r.json()}
+        logger.error("restart_service FAILED service=%s http=%d body=%.300s", service, r.status_code, r.text)
+        return {"status": "error", "service": service, "http_code": r.status_code, "detail": r.text[:500]}
+    except Exception as exc:
+        logger.error("restart_service ERROR service=%s err=%s", service, exc)
+        return {"status": "error", "service": service, "error": str(exc)}
+
+
 _LOCAL_HANDLERS: dict[str, Any] = {
-    "ping":           _handle_ping,
-    "gateway_status": _handle_gateway_status,
+    "ping":            _handle_ping,
+    "gateway_status":  _handle_gateway_status,
+    "restart_service": _handle_restart_service,
 }
 
 # == § 008  PROXY (_proxy) =====================================================
@@ -878,3 +942,37 @@ async def health() -> dict:
         "circuit_breaker": _circuit.to_dict(),
         "db_v3_url":       DB_V3_URL,
     }
+
+
+# == S013  ADMIN ROUTES ========================================================
+# /admin/restart/{service}: emergency watchdog endpoint.
+# Calls miller-gcloud-runner directly -- no db-v3 dependency.
+# Auth: X-API-Key header (same key as /execute).
+# Also callable as MCP tool restart_service for Claude Chat sessions.
+# ------------------------------------------------------------------------------
+@app.post("/admin/restart/{service}")
+async def admin_restart(service: str, request: Request) -> JSONResponse:
+    """
+    Emergency restart endpoint -- callable from curl/Tampermonkey when db-v3 is down.
+    Auth: X-API-Key header required.
+    Bypasses db-v3 entirely -- routes through miller-gcloud-runner only.
+    Example: curl -X POST https://<gateway>/admin/restart/miller-mcp-db-v3 -H 'X-API-Key: <key>'
+    """
+    api_key = request.headers.get("x-api-key", "")
+    if api_key != API_KEY:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    result = await _handle_restart_service({"service": service})
+    return JSONResponse(
+        status_code=200 if result.get("status") == "ok" else 400,
+        content=result,
+    )
+
+
+@app.get("/admin/restart/{service}")
+async def admin_restart_info(service: str) -> JSONResponse:
+    """Discovery -- tells callers to use POST."""
+    return JSONResponse(status_code=405, content={
+        "error": "Use POST with X-API-Key header",
+        "allowed_services": sorted(_RESTARTABLE_SERVICES),
+        "example": f"curl -X POST https://miller-mcp-gateway-146372550543.us-central1.run.app/admin/restart/{service} -H 'X-API-Key: <key>'",
+    })
