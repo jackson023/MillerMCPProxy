@@ -68,12 +68,12 @@ DB_V3_HEALTH  = f"{DB_V3_URL}/health"
 API_KEY       = os.environ.get("API_KEY", "")  # Required — set via Cloud Run env var. No hardcoded fallback.
 GW_VERSION          = "3.1.1"
 
-# S1409: traceparent -> session_key cache for context telemetry.
+# S1409: Last-known session_key for context telemetry.
 # Tools like platform_search don't carry session_key in arguments.
-# When any tool call DOES include session_key, we cache {trace_id: sk}.
-# Subsequent calls in the same turn (same traceparent) use the cached value.
-# Simple dict with bounded size -- clears at 200 entries (covers concurrent sessions).
-_sk_cache: dict[str, str] = {}
+# When any tool call DOES include session_key, we store it here.
+# Subsequent calls without session_key use it as fallback.
+# Single-user gateway -- one active session at a time.
+_last_known_sk: str = ""
 GCLOUD_RUNNER_URL   = os.environ.get("GCLOUD_RUNNER_URL", "https://miller-gcloud-runner-146372550543.us-central1.run.app")
 GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
 
@@ -778,16 +778,14 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             text = str(result)
 
         # S1409: Context telemetry -- fire-and-forget response size recording
-        # Toyota: cache session_key by traceparent trace_id so tools without
-        # session_key in arguments (e.g. platform_search) are still recorded.
+        # Toyota: store last-known session_key so tools without session_key
+        # in arguments (e.g. platform_search) are still recorded.
+        global _last_known_sk
         _ct_sk = (arguments or {}).get('session_key', '') if isinstance(arguments, dict) else ''
-        _ct_trace = (arguments or {}).get('_anthropic_trace_id', '') if isinstance(arguments, dict) else ''
-        if _ct_sk and _ct_trace:
-            if len(_sk_cache) > 200:
-                _sk_cache.clear()
-            _sk_cache[_ct_trace] = _ct_sk
-        elif not _ct_sk and _ct_trace:
-            _ct_sk = _sk_cache.get(_ct_trace, '')
+        if _ct_sk:
+            _last_known_sk = _ct_sk
+        else:
+            _ct_sk = _last_known_sk
         if _ct_sk and tool_name not in _LOCAL_HANDLERS:
             _ct_req = len(json.dumps(arguments, default=str)) if isinstance(arguments, dict) else 0
             _ct_resp = len(text)
