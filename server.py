@@ -570,6 +570,21 @@ async def _handle_tools_list(params: dict, req_id: Any) -> dict:
     return _ok(req_id, {"tools": _BOOTSTRAP_TOOLS})
 
 
+async def _fire_context_telemetry(sk: str, tn: str, req_b: int, resp_b: int) -> None:
+    """Fire-and-forget: record tool response size for context budget tracking. S1409."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.0)) as c:
+            await c.post(DB_V3_EXECUTE, json={
+                "tool_name": "record_context_telemetry",
+                "arguments": {
+                    "session_key": sk, "tool_name": tn,
+                    "request_bytes": req_b, "response_bytes": resp_b,
+                },
+            }, headers={"X-API-Key": API_KEY, "Content-Type": "application/json"})
+    except Exception:
+        pass  # fire-and-forget -- never block MCP response
+
+
 async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
@@ -754,6 +769,13 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             text = json.dumps({"status": "ok"})
         else:
             text = str(result)
+
+        # S1409: Context telemetry -- fire-and-forget response size recording
+        _ct_sk = (arguments or {}).get('session_key', '') if isinstance(arguments, dict) else ''
+        if _ct_sk and tool_name not in _LOCAL_HANDLERS:
+            _ct_req = len(json.dumps(arguments, default=str)) if isinstance(arguments, dict) else 0
+            _ct_resp = len(text)
+            asyncio.create_task(_fire_context_telemetry(_ct_sk, tool_name, _ct_req, _ct_resp))
 
         content_blocks = [{"type": "text", "text": text}]
         if inline_image_b64:
