@@ -712,10 +712,34 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     # check is structurally scoped to exactly the traffic that can hit the S1220 transport
     # bug -- it cannot slow down or break internal automation. Unconditional: no force=True
     # bypass, no size threshold to estimate. One path, every time, for this traffic class.
-    _STAGING_REQUIRED_TOOLS = {"platform_publish", "platform_learn", "pi_publish"}
-    _STAGING_REQUIRED_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
-    if tool_name in _STAGING_REQUIRED_TOOLS and isinstance(arguments, dict):
-        _g35_hits = [f for f in _STAGING_REQUIRED_FIELDS if arguments.get(f)]
+    # S1418: per-tool field map, replacing the flat shared tuple. save_session's
+    # heavy field is `intelligence`, which has nothing to do with the write-path
+    # fields, so one shared tuple could not express it without gating fields on
+    # tools that do not have them. Extended to save_session on the evidence in
+    # [bug] #27719: inline meta_tool args arrive TRUNCATED from the client (json
+    # error position == len, i.e. an incomplete document, logged live at 2846
+    # chars -- under the 3000 threshold, so no block fired). A truncated
+    # checkpoint silently loses an entire session's intelligence. Staging leaves
+    # only a ~100-char URL on the wire, putting the payload structurally out of
+    # reach of the failure rather than merely labelling it better.
+    # `summary` is deliberately NOT gated: gating it would force a second upload
+    # on every checkpoint platform-wide, and with `intelligence` staged the
+    # remaining args fall far below the threshold. save_session still accepts
+    # summary_gcs_url for callers with genuinely large summaries.
+    # PREREQUISITE, already shipped and verified: save_session v23 accepts
+    # intelligence_gcs_url / summary_gcs_url / gcs_url+gcs_field. Never add a
+    # tool here before its staged path exists -- this gate blocks the inline
+    # path, so gating first would hard-fail every call with no route through.
+    _WRITE_PATH_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
+    _STAGING_REQUIRED = {
+        "platform_publish": _WRITE_PATH_FIELDS,
+        "platform_learn": _WRITE_PATH_FIELDS,
+        "pi_publish": _WRITE_PATH_FIELDS,
+        "save_session": ("intelligence",),
+    }
+    _g35_fields = _STAGING_REQUIRED.get(tool_name)
+    if _g35_fields and isinstance(arguments, dict):
+        _g35_hits = [f for f in _g35_fields if arguments.get(f)]
         if _g35_hits:
             logger.info(
                 "gate35_staging_required tool=%s fields=%s trace=%s",
@@ -732,7 +756,9 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                         "Stage via POST /platform/upload (X-Upload-Filename ending .txt, "
                         "Content-Type: text/plain), then pass the matching *_gcs_url param "
                         "instead: code_gcs_url, patches_gcs_url, sql_gcs_url, js_gcs_url, "
-                        "yaml_gcs_url, jinja_gcs_url, shell_gcs_url, html_gcs_url, content_gcs_url."
+                        "yaml_gcs_url, jinja_gcs_url, shell_gcs_url, html_gcs_url, content_gcs_url. "
+                        "For save_session: intelligence_gcs_url (or gcs_url + gcs_field='intelligence'). "
+                        "The generic gcs_url + gcs_field pair works on all of these."
                     ),
                 })}],
                 "isError": True,
