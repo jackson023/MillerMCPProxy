@@ -730,12 +730,19 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     # intelligence_gcs_url / summary_gcs_url / gcs_url+gcs_field. Never add a
     # tool here before its staged path exists -- this gate blocks the inline
     # path, so gating first would hard-fail every call with no route through.
+    # S1425: pi_publish v8 (section_patches_gcs_url / gcs_url+gcs_field=
+    # 'section_patches') and patch_tool_js v6 (js_gcs_url / gcs_url+gcs_field=
+    # 'js') both live-verified end to end before being added below -- staged
+    # a real patch, applied it, confirmed correct, reverted/retired. Same
+    # prerequisite-before-gate discipline as save_session above ([bug]#27972,
+    # [bug]#27973, [decision]#30129, [decision]#30135).
     _WRITE_PATH_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
     _STAGING_REQUIRED = {
         "platform_publish": _WRITE_PATH_FIELDS,
         "platform_learn": _WRITE_PATH_FIELDS,
-        "pi_publish": _WRITE_PATH_FIELDS,
+        "pi_publish": _WRITE_PATH_FIELDS + ("section_patches",),
         "save_session": ("intelligence",),
+        "patch_tool_js": ("js",),
     }
     _g35_fields = _STAGING_REQUIRED.get(tool_name)
     if _g35_fields and isinstance(arguments, dict):
@@ -758,6 +765,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                         "instead: code_gcs_url, patches_gcs_url, sql_gcs_url, js_gcs_url, "
                         "yaml_gcs_url, jinja_gcs_url, shell_gcs_url, html_gcs_url, content_gcs_url. "
                         "For save_session: intelligence_gcs_url (or gcs_url + gcs_field='intelligence'). "
+                        "For pi_publish section_patches: section_patches_gcs_url (or gcs_url + gcs_field='section_patches'). "
                         "The generic gcs_url + gcs_field pair works on all of these."
                     ),
                 })}],
