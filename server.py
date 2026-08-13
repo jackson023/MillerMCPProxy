@@ -679,6 +679,23 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         tool_name = inner or tool_name
         arguments = inner_args
 
+    # [prompt-standard]#13457 fix: normalize patches/section_patches to a list.
+    # Callers used to pre-serialize as a JSON string to survive the MCP transport
+    # boundary -- one gateway fix eliminates that tax for every caller forever.
+    # Both the meta_tool-wrapped path (inner_args just set above) and the direct
+    # call path (arguments set at line ~597) converge here before Gate 35.
+    if isinstance(arguments, dict):
+        for _norm_field in ("patches", "section_patches"):
+            _norm_val = arguments.get(_norm_field)
+            if isinstance(_norm_val, str) and _norm_val.strip().startswith("["):
+                try:
+                    arguments[_norm_field] = json.loads(_norm_val)
+                    logger.debug(
+                        "patches_normalized tool=%s field=%s", tool_name, _norm_field
+                    )
+                except Exception:
+                    pass  # malformed -- leave as-is, tool reports clearly
+
     # ── Tier 0: Auto-inject conversation UUID from gateway headers ────────
     # When open_session arrives without a UUID (native app, iPhone, any client)
     # check the captured MCP request headers for a conversation UUID.
@@ -741,7 +758,6 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         "platform_publish": _WRITE_PATH_FIELDS,
         "platform_learn": _WRITE_PATH_FIELDS,
         "pi_publish": _WRITE_PATH_FIELDS + ("section_patches",),
-        "save_session": ("intelligence",),
         "patch_tool_js": ("js",),
     }
     _g35_fields = _STAGING_REQUIRED.get(tool_name)
