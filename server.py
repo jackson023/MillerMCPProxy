@@ -723,36 +723,29 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             arguments = {**(arguments or {}), '_anthropic_trace_id': _tp_parts[1]}
             logger.debug("trace_id_inject trace_id=%s tool=%s", _tp_parts[1], tool_name)
 
-    # S1353: Gate 35 -- mandatory GCS staging for write-path tools, Claude Chat / agent
-    # calls only. Internal server-side _dispatch() calls never reach this gateway file at
-    # all (in-process function call, no HTTP hop, no JSON serialization boundary) so this
-    # check is structurally scoped to exactly the traffic that can hit the S1220 transport
-    # bug -- it cannot slow down or break internal automation. Unconditional: no force=True
-    # bypass, no size threshold to estimate. One path, every time, for this traffic class.
-    # S1418: per-tool field map, replacing the flat shared tuple. save_session's
-    # heavy field is `intelligence`, which has nothing to do with the write-path
-    # fields, so one shared tuple could not express it without gating fields on
-    # tools that do not have them. Extended to save_session on the evidence in
-    # [bug] #27719: inline meta_tool args arrive TRUNCATED from the client (json
-    # error position == len, i.e. an incomplete document, logged live at 2846
-    # chars -- under the 3000 threshold, so no block fired). A truncated
-    # checkpoint silently loses an entire session's intelligence. Staging leaves
-    # only a ~100-char URL on the wire, putting the payload structurally out of
-    # reach of the failure rather than merely labelling it better.
-    # `summary` is deliberately NOT gated: gating it would force a second upload
-    # on every checkpoint platform-wide, and with `intelligence` staged the
-    # remaining args fall far below the threshold. save_session still accepts
-    # summary_gcs_url for callers with genuinely large summaries.
-    # PREREQUISITE, already shipped and verified: save_session v23 accepts
-    # intelligence_gcs_url / summary_gcs_url / gcs_url+gcs_field. Never add a
-    # tool here before its staged path exists -- this gate blocks the inline
-    # path, so gating first would hard-fail every call with no route through.
-    # S1425: pi_publish v8 (section_patches_gcs_url / gcs_url+gcs_field=
-    # 'section_patches') and patch_tool_js v6 (js_gcs_url / gcs_url+gcs_field=
-    # 'js') both live-verified end to end before being added below -- staged
-    # a real patch, applied it, confirmed correct, reverted/retired. Same
-    # prerequisite-before-gate discipline as save_session above ([bug]#27972,
-    # [bug]#27973, [decision]#30129, [decision]#30135).
+    # S1353: Gate 35 -- blocks inline write-path fields for write-path tools from
+    # Claude Chat / agent calls. Internal server-side _dispatch() calls never reach
+    # this gateway at all (in-process, no HTTP hop, no serialization boundary) so this
+    # is structurally scoped to exactly the traffic that truncates at the MCP boundary.
+    # Unconditional: no force=True bypass, no size threshold. One path, every time.
+    # S1418: per-tool field map -- save_session's heavy field is `intelligence`, one
+    # shared tuple could not express it without gating fields absent on other tools.
+    # Extended on evidence of [bug]#27719: inline args arrive TRUNCATED from the
+    # client. A truncated checkpoint silently loses a session's intelligence. Staging
+    # leaves only a ~100-char UUID on the wire -- payload is structurally out of reach
+    # of the transport failure rather than merely labelled better.
+    # BYPASS (DB-as-bus, S1439/S1441 -- GCS staging is DEAD since S1441):
+    #   stage_payload(payload=CONTENT, payload_type='ddl'|'sql'|'code'|'patches'|'js'|
+    #                 'css'|'html', session_key=SK) -> staged_id (UUID)
+    #   platform_publish(..., staged_id=STAGED_ID,
+    #                    staged_field='content'|'sql'|'code'|'patches'|'js',
+    #                    session_key=SK)
+    # staged_id is a UUID -- Gate 35 never fires on it. No GCS. No curl. No URLs.
+    # stage_payload validates at the door (AST/DDL dry-run/EXPLAIN) before storing.
+    # PREREQUISITE before adding a tool to _STAGING_REQUIRED: verify staged_id +
+    # staged_field path works end-to-end first. Gate blocks inline; gating before the
+    # bypass exists = hard-fail with no route through. [bug]#27972, [bug]#27973,
+    # [decision]#30129, [decision]#30135.
     _WRITE_PATH_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
     _STAGING_REQUIRED = {
         "platform_publish": _WRITE_PATH_FIELDS,
@@ -771,18 +764,23 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             return _ok(req_id, {
                 "content": [{"type": "text", "text": json.dumps({
                     "error": (
-                        f"BLOCKED: {tool_name} requires GCS staging for {_g35_hits} -- "
-                        f"inline not accepted, regardless of size."
+                        f"BLOCKED: {tool_name} field(s) {_g35_hits} must be staged, "
+                        f"not passed inline. Use stage_payload() -> staged_id."
                     ),
                     "fields": _g35_hits,
                     "fix": (
-                        "Stage via POST /platform/upload (X-Upload-Filename ending .txt, "
-                        "Content-Type: text/plain), then pass the matching *_gcs_url param "
-                        "instead: code_gcs_url, patches_gcs_url, sql_gcs_url, js_gcs_url, "
-                        "yaml_gcs_url, jinja_gcs_url, shell_gcs_url, html_gcs_url, content_gcs_url. "
-                        "For save_session: intelligence_gcs_url (or gcs_url + gcs_field='intelligence'). "
-                        "For pi_publish section_patches: section_patches_gcs_url (or gcs_url + gcs_field='section_patches'). "
-                        "The generic gcs_url + gcs_field pair works on all of these."
+                        "DB is the bus -- GCS staging is dead since S1441. "
+                        "Correct path: "
+                        "(1) stage_payload(payload=CONTENT, "
+                        "payload_type='ddl'|'sql'|'code'|'patches'|'js'|'css'|'html', "
+                        "session_key=SK) -> returns staged_id (UUID). "
+                        "(2) platform_publish(..., staged_id=STAGED_ID, "
+                        "staged_field='content'|'sql'|'code'|'patches'|'js', "
+                        "session_key=SK). "
+                        "stage_payload validates at the door before storing -- "
+                        "broken code never enters the DB. "
+                        "staged_id is a UUID, never a write-path field -- "
+                        "Gate 35 never fires on it."
                     ),
                 })}],
                 "isError": True,
