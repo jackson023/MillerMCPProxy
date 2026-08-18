@@ -73,6 +73,11 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-platform-api-key
+        - name: RUNNER_MASTER_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-runner-master-secret
         startupProbe:
           tcpSocket:
             port: 8080
