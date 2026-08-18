@@ -78,6 +78,11 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-runner-master-secret
+        - name: RUNNER_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-runner-jwt-secret
         startupProbe:
           tcpSocket:
             port: 8080
