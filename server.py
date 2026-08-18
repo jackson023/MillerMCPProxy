@@ -761,12 +761,9 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     # bypass exists = hard-fail with no route through. [bug]#27972, [bug]#27973,
     # [decision]#30129, [decision]#30135.
     _WRITE_PATH_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
-    _STAGING_REQUIRED = {
-        "platform_publish": _WRITE_PATH_FIELDS,
-        "platform_learn": _WRITE_PATH_FIELDS,
-        "pi_publish": _WRITE_PATH_FIELDS + ("section_patches",),
-        "patch_tool_js": ("js",),
-    }
+    # Gate 35 killed S1462 -- enforcement moved to publish_gate_registry.
+    # Gateway loads watched_tools/watched_fields from DB at startup via _startup().
+    _STAGING_REQUIRED = {}  # empty -- DB-backed startup load handles enforcement
     _g35_fields = _STAGING_REQUIRED.get(tool_name)
     if _g35_fields and isinstance(arguments, dict):
         _g35_hits = [f for f in _g35_fields if arguments.get(f)]
