@@ -362,7 +362,16 @@ async def _handle_restart_service(args: dict) -> dict:
             r = await client.post(
                 GCLOUD_RUNNER_EXEC,
                 json={"tool_name": "run_gcloud", "arguments": {"command": command, "timeout": 75}},
-                headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+                headers={
+                    # S1461: TOTP derived from RUNNER_MASTER_SECRET (mounted via Cloud Run secret).
+                    # gcloud-runner /execute requires TOTP X-API-Key, not static API_KEY.
+                    "X-API-Key": __import__("hmac").new(
+                        (os.environ.get("RUNNER_MASTER_SECRET") or "").encode(),
+                        str(int(__import__("time").time()) // 300).encode(),
+                        __import__("hashlib").sha256,
+                    ).hexdigest(),
+                    "Content-Type": "application/json",
+                },
             )
         if r.status_code == 200:
             logger.info("restart_service OK service=%s", service)
