@@ -361,7 +361,7 @@ async def _handle_restart_service(args: dict) -> dict:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=5.0)) as client:
             r = await client.post(
                 GCLOUD_RUNNER_EXEC,
-                json={"tool_name": "run_gcloud", "arguments": {"command": command, "timeout": 75}},
+                json={"tool_name": "run_gcloud", "arguments": {"command": command, "timeout": 75}, "session_key": _last_known_sk},
                 headers={
                     # S1461 v2: Bearer JWT auth (HS256, aud=miller-gcloud-runner).
                     # gcloud-runner jwt_loaded=true confirmed. Replaces broken TOTP path.
