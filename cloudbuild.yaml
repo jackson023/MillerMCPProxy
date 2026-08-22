@@ -29,7 +29,7 @@ steps:
     COMMIT_MSG=$(git log -1 --pretty=%s 2>/dev/null || echo "")
     CHANGED_FILES="$CHANGED" INFRA_FILES="$INFRA" COMMIT_MSG="$COMMIT_MSG" \
       STEP=build_started STATUS=ok REPO=MillerMCPProxy \
-      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$PLATFORM_API_KEY" \
       python3 /workspace/scripts/build_telemetry.py \
       || echo "WARNING: record-build-started failed (non-blocking)"
   waitFor: ['-']
@@ -92,7 +92,7 @@ steps:
       --project="$_PROJECT" --format='value(image_summary.digest)' 2>/dev/null || echo "")
     STEP=image_push_complete STATUS=ok REPO=MillerMCPProxy \
       IMAGE="$_IMAGE:$COMMIT_SHA" IMAGE_DIGEST="$DIGEST" \
-      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$PLATFORM_API_KEY" \
       python3 /workspace/scripts/build_telemetry.py \
       || echo "WARNING: record-push-complete failed (non-blocking)"
   waitFor:
@@ -176,7 +176,7 @@ steps:
     STEP=deploy_complete STATUS="$DEPLOY_STATUS" REPO=MillerMCPProxy \
       REVISION="$REVISION" CR_STATUS="$CR_STATUS" \
       IMAGE="$_IMAGE:$COMMIT_SHA" \
-      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$PLATFORM_API_KEY" \
       python3 /workspace/scripts/build_telemetry.py \
       || echo "WARNING: record-deploy-result failed (non-blocking)"
   waitFor:
@@ -226,7 +226,7 @@ steps:
 
     echo "Posting boot crash attribution to telemetry..."
     if [ -f /workspace/crash_payload.json ]; then
-      HTTP_CODE=$(curl -sf -o /tmp/crash_resp.json -w "%{http_code}" --max-time 30 --retry 0 -X POST "$_GATEWAY" -H "Content-Type: application/json" -H "X-API-Key: $$PLATFORM_API_KEY" -d @/workspace/crash_payload.json 2>/dev/null || echo "000")
+      HTTP_CODE=$(curl -sf -o /tmp/crash_resp.json -w "%{http_code}" --max-time 30 --retry 0 -X POST "$_GATEWAY" -H "Content-Type: application/json" -H "X-API-Key: $PLATFORM_API_KEY" -d @/workspace/crash_payload.json 2>/dev/null || echo "000")
       echo "Telemetry HTTP: $HTTP_CODE"
       cat /tmp/crash_resp.json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('stored:', d.get('stored'), '| crash:', d.get('crash_file'), ':', d.get('crash_line'), '| error:', d.get('error_name'))" 2>/dev/null || true
     else
@@ -281,7 +281,7 @@ steps:
         --retry 0 \
         -X POST "$_GATEWAY" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $$PLATFORM_API_KEY" \
+        -H "X-API-Key: $PLATFORM_API_KEY" \
         -d "$PAYLOAD" 2>/dev/null || echo "000")
 
       echo "HTTP status: $HTTP_CODE"
