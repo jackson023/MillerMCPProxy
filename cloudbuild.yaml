@@ -24,12 +24,14 @@ steps:
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   secretEnv: ['PLATFORM_API_KEY']
   script: |
-    curl -sf --max-time 10 \
-      -X POST "$_GATEWAY" \
-      -H "Content-Type: application/json" \
-      -H "X-API-Key: $$PLATFORM_API_KEY" \
-      -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"build_started\",\"status\":\"ok\"}}" \
-      || echo "telemetry non-blocking"
+    CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+    INFRA=$(echo "$CHANGED" | grep -E '(Dockerfile|cloudbuild\.yaml|requirements\.txt|service\.yaml)' || echo "")
+    COMMIT_MSG=$(git log -1 --pretty=%s 2>/dev/null || echo "")
+    CHANGED_FILES="$CHANGED" INFRA_FILES="$INFRA" COMMIT_MSG="$COMMIT_MSG" \
+      STEP=build_started STATUS=ok REPO=MillerMCPProxy \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      python3 /workspace/scripts/build_telemetry.py \
+      || echo "WARNING: record-build-started failed (non-blocking)"
   waitFor: ['-']
 
 - id: pull-cache
@@ -40,6 +42,7 @@ steps:
   - docker pull $_IMAGE:latest || echo "No cache - cold build"
   env:
   - DOCKER_BUILDKIT=1
+  waitFor: ['-']
 
 - id: build
   name: gcr.io/cloud-builders/docker
@@ -67,16 +70,31 @@ steps:
   waitFor:
   - build
 
+- id: record-build-complete
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  secretEnv: ['PLATFORM_API_KEY']
+  entrypoint: bash
+  args:
+  - -c
+  - |
+    STEP=docker_build_complete STATUS=ok REPO=MillerMCPProxy \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      python3 /workspace/scripts/build_telemetry.py \
+      || echo "WARNING: record-build-complete failed (non-blocking)"
+  waitFor:
+  - build
+
 - id: record-push-complete
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   secretEnv: ['PLATFORM_API_KEY']
   script: |
-    curl -sf --max-time 10 \
-      -X POST "$_GATEWAY" \
-      -H "Content-Type: application/json" \
-      -H "X-API-Key: $$PLATFORM_API_KEY" \
-      -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"image_push_complete\",\"status\":\"ok\"}}" \
-      || echo "telemetry non-blocking"
+    DIGEST=$(gcloud artifacts docker images describe "$_IMAGE:$COMMIT_SHA" \
+      --project="$_PROJECT" --format='value(image_summary.digest)' 2>/dev/null || echo "")
+    STEP=image_push_complete STATUS=ok REPO=MillerMCPProxy \
+      IMAGE="$_IMAGE:$COMMIT_SHA" IMAGE_DIGEST="$DIGEST" \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      python3 /workspace/scripts/build_telemetry.py \
+      || echo "WARNING: record-push-complete failed (non-blocking)"
   waitFor:
   - push
 
@@ -147,18 +165,20 @@ steps:
   waitFor:
   - vuln-scan-gate
 
-- id: record-deploy-complete
+- id: record-deploy-result
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   secretEnv: ['PLATFORM_API_KEY']
   script: |
     DEPLOY_EXIT=$(cat /workspace/deploy_exit.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
+    REVISION=$(cat /workspace/new_revision.txt 2>/dev/null | tr -d '[:space:]' || echo "")
+    CR_STATUS=$(cat /workspace/cr_status.txt 2>/dev/null | tr -d '[:space:]' || echo "")
     if [ "$DEPLOY_EXIT" = "0" ]; then DEPLOY_STATUS=ok; else DEPLOY_STATUS=error; fi
-    curl -sf --max-time 10 \
-      -X POST "$_GATEWAY" \
-      -H "Content-Type: application/json" \
-      -H "X-API-Key: $$PLATFORM_API_KEY" \
-      -d "{\"tool_name\":\"record_build_span\",\"arguments\":{\"build_id\":\"$BUILD_ID\",\"commit_sha\":\"$COMMIT_SHA\",\"repo\":\"MillerMCPProxy\",\"step\":\"deploy_complete\",\"status\":\"$DEPLOY_STATUS\"}}" \
-      || echo "telemetry non-blocking"
+    STEP=deploy_complete STATUS="$DEPLOY_STATUS" REPO=MillerMCPProxy \
+      REVISION="$REVISION" CR_STATUS="$CR_STATUS" \
+      IMAGE="$_IMAGE:$COMMIT_SHA" \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      python3 /workspace/scripts/build_telemetry.py \
+      || echo "WARNING: record-deploy-result failed (non-blocking)"
   waitFor:
   - deploy
 
