@@ -388,10 +388,68 @@ async def _handle_restart_service(args: dict) -> dict:
         return {"status": "error", "service": service, "error": str(exc)}
 
 
+# @zero_usage_confirmed -- server.py is a GitHub infra file, not a tool_registry entry
+async def _handle_code_edit(arguments: dict) -> Any:
+    """Gateway interceptor: auto-stage string params in code_edit calls.
+
+    Eliminates Pattern B. Any plain string in params.find / params.end_find /
+    params.new_src is staged automatically via stage_payload before the call
+    reaches db-v3. Claude passes plain strings -- no escaping, no pre-staging,
+    no Pattern B ritual. Fail-open: staging failure passes raw string through.
+
+    Handles: single-op (params={}), batch-ops (ops=[...]).
+    Pass-through: tools_ops=, tools='all' (complex batch, handled in db-v3).
+    """
+    import uuid as _uuid
+    _trace = str(_uuid.uuid4())
+    session_key = (arguments or {}).get("session_key", "")
+    args = dict(arguments or {})
+    _STAGE_FIELDS = ("find", "end_find", "new_src")
+
+    async def _auto_stage_params(params: dict) -> dict:
+        if not isinstance(params, dict):
+            return params
+        out = dict(params)
+        for field in _STAGE_FIELDS:
+            val = params.get(field)
+            if val and isinstance(val, str) and not params.get(f"{field}_staged_id"):
+                try:
+                    stage_res = await _proxy("stage_payload", {
+                        "payload": val,
+                        "payload_type": "html",
+                        "session_key": session_key,
+                    }, _trace)
+                    sid = (stage_res or {}).get("result", {}).get("staged_id")
+                    if sid:
+                        out.pop(field)
+                        out[f"{field}_staged_id"] = sid
+                except Exception as _e:
+                    logger.warning(
+                        "code_edit auto-stage FAILED field=%s err=%s -- passing raw",
+                        field, _e,
+                    )
+        return out
+
+    if "params" in args and isinstance(args.get("params"), dict):
+        args["params"] = await _auto_stage_params(args["params"])
+
+    if "ops" in args and isinstance(args.get("ops"), list):
+        staged_ops = []
+        for op_item in args["ops"]:
+            if isinstance(op_item, dict) and isinstance(op_item.get("params"), dict):
+                op_item = dict(op_item)
+                op_item["params"] = await _auto_stage_params(op_item["params"])
+            staged_ops.append(op_item)
+        args["ops"] = staged_ops
+
+    return await _proxy("code_edit", args, _trace)
+
+
 _LOCAL_HANDLERS: dict[str, Any] = {
     "ping":            _handle_ping,
     "gateway_status":  _handle_gateway_status,
     "restart_service": _handle_restart_service,
+    "code_edit":       _handle_code_edit,
 }
 
 # == § 008  PROXY (_proxy) =====================================================
@@ -760,7 +818,6 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     # staged_field path works end-to-end first. Gate blocks inline; gating before the
     # bypass exists = hard-fail with no route through. [bug]#27972, [bug]#27973,
     # [decision]#30129, [decision]#30135.
-    _WRITE_PATH_FIELDS = ("code", "patches", "sql", "js", "yaml", "jinja", "shell", "html", "content")
     # Gate 35 killed S1462 -- enforcement moved to publish_gate_registry.
     # Gateway loads watched_tools/watched_fields from DB at startup via _startup().
     _STAGING_REQUIRED = {}  # empty -- DB-backed startup load handles enforcement
