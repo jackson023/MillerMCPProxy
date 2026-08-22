@@ -389,6 +389,7 @@ async def _handle_restart_service(args: dict) -> dict:
 
 
 # @zero_usage_confirmed -- server.py is a GitHub infra file, not a tool_registry entry
+# S1503: gateway auto-stage interceptor -- eliminates Pattern B for code_edit callers
 async def _handle_code_edit(arguments: dict) -> Any:
     """Gateway interceptor: auto-stage string params in code_edit calls.
 
