@@ -771,7 +771,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         # Normalize payload: Python list/dict -> JSON string.
         # stage_payload's validation gate calls json.loads(payload) -- it needs a
         # string. When Claude passes a native list, serialize it here at the boundary
-        # so the tool always receives a JSON string regardless of caller. S1504.
+        # so the tool always receives a JSON string regardless of caller. S1504 fix.
         _sp_payload = arguments.get("payload")
         if isinstance(_sp_payload, (list, dict)):
             arguments["payload"] = json.dumps(_sp_payload)
