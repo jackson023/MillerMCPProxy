@@ -768,6 +768,14 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                     )
                 except Exception:
                     pass  # malformed -- leave as-is, tool reports clearly
+        # Normalize payload: Python list/dict -> JSON string.
+        # stage_payload's validation gate calls json.loads(payload) -- it needs a
+        # string. When Claude passes a native list, serialize it here at the boundary
+        # so the tool always receives a JSON string regardless of caller. S1504.
+        _sp_payload = arguments.get("payload")
+        if isinstance(_sp_payload, (list, dict)):
+            arguments["payload"] = json.dumps(_sp_payload)
+            logger.debug("payload_serialized tool=%s", tool_name)
 
     # ── Tier 0: Auto-inject conversation UUID from gateway headers ────────
     # When open_session arrives without a UUID (native app, iPhone, any client)
