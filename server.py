@@ -144,15 +144,17 @@ class CircuitBreaker:
     half-open → one probe allowed after recovery_s seconds
     """
 
-    def __init__(self, threshold: int = 5, recovery_s: float = 30.0) -> None:
-        self.threshold   = threshold
-        self.recovery_s  = recovery_s
+    def __init__(self, threshold: int = 5, recovery_s: float = 30.0, breaker_name: str = "db_v3_proxy") -> None:
+        self.threshold    = threshold
+        self.recovery_s   = recovery_s
+        self.breaker_name = breaker_name
         self._failures:  int          = 0
         self._opened_at: float | None = None
         self._state:     str          = "closed"
 
     def record_success(self) -> None:
-        if self._state != "closed":
+        _was_open = self._state != "closed"
+        if _was_open:
             logger.info(
                 "circuit_breaker CLOSED — db-v3 recovered after %d failures",
                 self._failures,
@@ -160,12 +162,16 @@ class CircuitBreaker:
         self._failures  = 0
         self._opened_at = None
         self._state     = "closed"
+        if _was_open:
+            _schedule_persist(self)
 
     def record_failure(self) -> None:
         self._failures += 1
+        _opened = False
         if self._failures >= self.threshold and self._state == "closed":
             self._state     = "open"
             self._opened_at = time.monotonic()
+            _opened = True
             logger.error(
                 "circuit_breaker OPENED after %d consecutive failures — db-v3 considered down",
                 self._failures,
@@ -173,7 +179,10 @@ class CircuitBreaker:
         elif self._state == "half-open":
             self._state     = "open"
             self._opened_at = time.monotonic()
+            _opened = True
             logger.error("circuit_breaker half-open probe FAILED — reopening")
+        if _opened:
+            _schedule_persist(self)
 
     def allow_request(self) -> bool:
         if self._state == "closed":
@@ -206,6 +215,57 @@ class CircuitBreaker:
             "recovery_s":          self.recovery_s,
             "seconds_until_retry": seconds_until_retry,
         }
+
+
+# == § 005b  CIRCUIT BREAKER PERSISTENCE (decision #33575 lineage, Task 4) ====
+# Best-effort, fire-and-forget persistence through db-v3's gateway_circuit_state
+# tool -- the gateway never touches AlloyDB directly (single-service-touches-DB
+# architecture). Only fires on state TRANSITIONS (open/close), never on every
+# request, and never awaited inline -- cannot add latency or a new failure mode
+# to the hot path this breaker exists to protect.
+# ---------------------------------------------------------------------------
+_PROCESS_START_MONOTONIC = time.monotonic()
+_PROCESS_START_WALL      = time.time()
+
+
+def _monotonic_to_wall_iso(mono_ts: float | None) -> str | None:
+    if mono_ts is None:
+        return None
+    from datetime import datetime, timezone
+    wall = _PROCESS_START_WALL + (mono_ts - _PROCESS_START_MONOTONIC)
+    return datetime.fromtimestamp(wall, tz=timezone.utc).isoformat()
+
+
+async def _persist_circuit_state(breaker: "CircuitBreaker") -> None:
+    """Fire-and-forget persistence of a circuit breaker state transition.
+    Swallows all errors -- persistence failing must never affect proxy behavior.
+    """
+    try:
+        payload = {
+            "tool_name": "gateway_circuit_state",
+            "arguments": {
+                "action":       "set",
+                "breaker_name": breaker.breaker_name,
+                "state":        breaker.state,
+                "failures":     breaker.failures,
+                "threshold":    breaker.threshold,
+                "recovery_s":   breaker.recovery_s,
+                "opened_at":    _monotonic_to_wall_iso(breaker._opened_at),
+            },
+        }
+        headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
+            await client.post(DB_V3_EXECUTE, json=payload, headers=headers)
+    except Exception as exc:
+        logger.warning("circuit_breaker persist failed (non-fatal): %s", exc)
+
+
+def _schedule_persist(breaker: "CircuitBreaker") -> None:
+    """Schedule persistence as a background task -- never awaited inline."""
+    try:
+        asyncio.create_task(_persist_circuit_state(breaker))
+    except RuntimeError:
+        pass  # no running event loop yet -- nothing to persist at import time
 
 
 _circuit = CircuitBreaker()
@@ -562,6 +622,47 @@ async def _startup() -> None:
         logger.info("Startup probe → db-v3 HTTP %d", r.status_code)
     except Exception as exc:
         logger.warning("Startup probe → db-v3 unreachable (non-fatal): %s", exc)
+
+    # Seed circuit breaker state from last persisted state (decision #33575
+    # lineage, Task 4). Best-effort, fail-open on any error -- same posture as
+    # the reachability probe above. Prevents a fresh deploy from serving full
+    # traffic straight into an ongoing db-v3 outage, and prevents it staying
+    # falsely OPEN forever after a real recovery that happened while this
+    # instance was down.
+    try:
+        from datetime import datetime
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            r = await client.post(
+                DB_V3_EXECUTE,
+                json={
+                    "tool_name": "gateway_circuit_state",
+                    "arguments": {"action": "get", "breaker_name": _circuit.breaker_name},
+                },
+                headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+            )
+        if r.status_code == 200:
+            _persisted = r.json()
+            if _persisted.get("found") and _persisted.get("state") == "open" and _persisted.get("opened_at"):
+                _opened_wall = datetime.fromisoformat(_persisted["opened_at"]).timestamp()
+                _elapsed = time.time() - _opened_wall
+                if _elapsed < _circuit.recovery_s:
+                    _circuit._state     = "open"
+                    _circuit._failures  = _persisted.get("failures", _circuit.threshold)
+                    _circuit._opened_at = time.monotonic() - _elapsed
+                    logger.warning(
+                        "Startup: seeded circuit breaker OPEN from persisted state "
+                        "(%.1fs into %.1fs recovery window)", _elapsed, _circuit.recovery_s,
+                    )
+                else:
+                    _circuit._state     = "half-open"
+                    _circuit._opened_at = time.monotonic() - _circuit.recovery_s
+                    logger.info(
+                        "Startup: seeded circuit breaker HALF-OPEN "
+                        "(persisted open state past recovery window)"
+                    )
+        logger.info("Startup: circuit breaker state seed complete — state=%s", _circuit.state)
+    except Exception as exc:
+        logger.warning("Startup: circuit breaker state seed failed (non-fatal, defaulting closed): %s", exc)
 
 
 # == § 010  JSON-RPC HELPERS ===================================================
