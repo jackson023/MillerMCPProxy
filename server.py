@@ -641,7 +641,7 @@ async def _startup() -> None:
                 headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
             )
         if r.status_code == 200:
-            _persisted = r.json()
+            _persisted = (r.json() or {}).get("result", {})
             if _persisted.get("found") and _persisted.get("state") == "open" and _persisted.get("opened_at"):
                 _opened_wall = datetime.fromisoformat(_persisted["opened_at"]).timestamp()
                 _elapsed = time.time() - _opened_wall
