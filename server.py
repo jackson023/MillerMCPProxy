@@ -74,6 +74,9 @@ GW_VERSION          = "3.1.1"
 # Subsequent calls without session_key use it as fallback.
 # Single-user gateway -- one active session at a time.
 _last_known_sk: str = ""
+_bg_tasks: set = set()  # retained refs for fire-and-forget asyncio tasks -- an
+# unreferenced task is GC-eligible under Cloud Run CPU throttling before it
+# ever runs (sTR #17/#55-A pattern); .discard on completion keeps this bounded.
 GCLOUD_RUNNER_URL   = os.environ.get("GCLOUD_RUNNER_URL", "https://miller-gcloud-runner-146372550543.us-central1.run.app")
 GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
 
@@ -751,15 +754,27 @@ async def _handle_tools_list(params: dict, req_id: Any) -> dict:
     return _ok(req_id, {"tools": _BOOTSTRAP_TOOLS})
 
 
-async def _fire_context_telemetry(sk: str, tn: str, req_b: int, resp_b: int) -> None:
-    """Fire-and-forget: record tool response size for context budget tracking. S1409."""
+_CONTEXT_TELEMETRY_TEXT_CAP = 60_000  # chars; bounds gateway->db-v3 telemetry payload size
+
+
+async def _fire_context_telemetry(sk: str, tn: str, req_text: str, resp_text: str) -> None:
+    """Fire-and-forget: record REAL tiktoken counts for context budget tracking.
+    S1409, upgraded S-context-estimator-2: sends truncated raw text instead of
+    just byte lengths -- record_context_telemetry tokenizes server-side via
+    estimate_tokens_local (single enforcement point, no second tokenizer here)
+    and stores real request_tokens/response_tokens. Byte counts still sent too,
+    as a permanent, cheap fallback for the rare case tokenization itself fails."""
+    req_b = len(req_text.encode("utf-8", errors="ignore"))
+    resp_b = len(resp_text.encode("utf-8", errors="ignore"))
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.0)) as c:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=1.0)) as c:
             await c.post(DB_V3_EXECUTE, json={
                 "tool_name": "record_context_telemetry",
                 "arguments": {
                     "session_key": sk, "tool_name": tn,
                     "request_bytes": req_b, "response_bytes": resp_b,
+                    "request_text": req_text[:_CONTEXT_TELEMETRY_TEXT_CAP],
+                    "response_text": resp_text[:_CONTEXT_TELEMETRY_TEXT_CAP],
                 },
             }, headers={"X-API-Key": API_KEY, "Content-Type": "application/json"})
     except Exception:
@@ -1006,6 +1021,12 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         # S1409: Context telemetry -- fire-and-forget response size recording
         # Toyota: store last-known session_key so tools without session_key
         # in arguments (e.g. platform_search) are still recorded.
+        # S-context-estimator-2: now passes raw text (capped) for real
+        # tiktoken measurement server-side, not just byte length. Task
+        # reference retained in _bg_tasks -- an unreferenced asyncio task
+        # is GC-eligible under Cloud Run's CPU throttling before it ever
+        # runs (the exact sTR #17/#55-A pattern), so this task was at real
+        # risk of silently never firing.
         global _last_known_sk
         _ct_sk = (arguments or {}).get('session_key', '') if isinstance(arguments, dict) else ''
         if _ct_sk:
@@ -1013,9 +1034,10 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         else:
             _ct_sk = _last_known_sk
         if _ct_sk and tool_name not in _LOCAL_HANDLERS:
-            _ct_req = len(json.dumps(arguments, default=str)) if isinstance(arguments, dict) else 0
-            _ct_resp = len(text)
-            asyncio.create_task(_fire_context_telemetry(_ct_sk, tool_name, _ct_req, _ct_resp))
+            _ct_req_text = json.dumps(arguments, default=str) if isinstance(arguments, dict) else ''
+            _ct_task = asyncio.create_task(_fire_context_telemetry(_ct_sk, tool_name, _ct_req_text, text))
+            _bg_tasks.add(_ct_task)
+            _ct_task.add_done_callback(_bg_tasks.discard)
 
         content_blocks = [{"type": "text", "text": text}]
         if inline_image_b64:
