@@ -129,15 +129,18 @@ def _presented_key(request: Request, allow_query: bool = False) -> str:
 
 
 async def _emit_auth_event(event_type: str, data: dict) -> None:
+    # platform_audit_log.entity_id is an integer column, so the gateway's identity travels in data.
+    payload = {"event_type": event_type, "entity_type": "gateway_auth",
+               "data": dict(data, gateway="miller-mcp-gateway")}
     try:
-        await _proxy(
-            "log_audit_event",
-            {"event_type": event_type, "entity_type": "gateway_auth",
-             "entity_id": "miller-mcp-gateway", "data": data},
-            str(uuid.uuid4()),
-        )
+        res = await _proxy("log_audit_event", payload, str(uuid.uuid4()))
     except Exception as exc:  # the bus write must never break or block the request
         logger.warning("auth_event_write_failed type=%s err=%s", event_type, exc)
+        return
+    # log_audit_event reports a rejected insert as {"status": "error"} inside an HTTP 200 -- never swallow it.
+    inner = res.get("result", res) if isinstance(res, dict) else {}
+    if not isinstance(inner, dict) or inner.get("status") != "ok":
+        logger.error("auth_event_write_rejected type=%s result=%.300s", event_type, res)
 
 
 def _record_auth_event(request: Request, route: str, state: str, mode: str) -> None:
