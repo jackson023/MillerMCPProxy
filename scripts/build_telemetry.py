@@ -60,11 +60,19 @@ def post_span(attrs: dict) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             result = json.loads(resp.read())
-            print(f"[telemetry] span written: trace_id={result.get('trace_id','?')} step={STEP}")
-            return True
     except Exception as e:
         print(f"[telemetry] WARNING: span post failed (non-fatal): {e}", file=sys.stderr)
         return False
+    # #52440: HTTP 200 only means the gateway answered. The dispatch result carries the real
+    # verdict (top level or nested under `result`), so read it instead of assuming success.
+    inner = result.get('result') if isinstance(result.get('result'), dict) else {}
+    verdict = str(inner.get('status') or result.get('status') or 'ok').lower()
+    err = result.get('error') or inner.get('error')
+    if err or verdict in ('error', 'blocked', 'failed', 'rejected'):
+        print(f"[telemetry] WARNING: gateway rejected span step={STEP} verdict={verdict}: {str(err)[:300]}", file=sys.stderr)
+        return False
+    print(f"[telemetry] span written: trace_id={result.get('trace_id') or inner.get('trace_id') or '?'} step={STEP}")
+    return True
 
 
 def step_build_started():
@@ -198,8 +206,17 @@ if __name__ == '__main__':
     if not GATEWAY or not API_KEY:
         print('ERROR: GATEWAY_URL and GATEWAY_KEY required', file=sys.stderr)
         sys.exit(1)
+    # #52440: fail LOUDLY, before any network call, when Cloud Build did not export its built-in
+    # substitutions. That happens when the step uses entrypoint/args instead of `script: |`.
+    if not BUILD_ID:
+        print('ERROR: BUILD_ID is empty -- the Cloud Build step must use `script: |` (not '
+              'entrypoint/args), which exports built-in substitutions as env vars (#52440)',
+              file=sys.stderr)
+        sys.exit(2)
+    for _n, _v in (('COMMIT_SHA', COMMIT_SHA), ('SHORT_SHA', SHORT_SHA)):
+        if not _v:
+            print(f'[telemetry] WARNING: {_n} is empty (manual build without a trigger?)', file=sys.stderr)
 
     handler = STEP_HANDLERS.get(STEP)
     attrs   = handler() if handler else {}
-    post_span(attrs)
-    sys.exit(0)
+    sys.exit(0 if post_span(attrs) else 1)

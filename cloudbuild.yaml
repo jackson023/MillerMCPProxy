@@ -73,12 +73,9 @@ steps:
 - id: record-build-complete
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   secretEnv: ['PLATFORM_API_KEY']
-  entrypoint: bash
-  args:
-  - -c
-  - |
+  script: |
     STEP=docker_build_complete STATUS=ok REPO=MillerMCPProxy \
-      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$$PLATFORM_API_KEY" \
+      GATEWAY_URL="$_GATEWAY" GATEWAY_KEY="$PLATFORM_API_KEY" \
       python3 /workspace/scripts/build_telemetry.py \
       || echo "WARNING: record-build-complete failed (non-blocking)"
   waitFor:
