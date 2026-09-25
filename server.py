@@ -36,6 +36,7 @@ Components:
 # § 012  Routes (/mcp POST, /mcp GET, /execute passthrough, /health)
 # ==============================================================================
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -66,7 +67,17 @@ DB_V3_URL     = os.environ.get("DB_V3_URL", "https://miller-mcp-db-v3-irj2rlhsea
 DB_V3_EXECUTE = f"{DB_V3_URL}/execute"
 DB_V3_HEALTH  = f"{DB_V3_URL}/health"
 API_KEY       = os.environ.get("API_KEY", "")  # Required — set via Cloud Run env var. No hardcoded fallback.
-GW_VERSION          = "3.1.1"
+# Bug 52545: dual-key acceptance. API_KEY_SECONDARY is any additional accepted key (the incoming
+# key before a swap, the outgoing key after it). It is accepted but never sent upstream.
+# The sentinel "unset" (or anything shorter than _MIN_KEY_LEN) means no rotation window is open.
+API_KEY_SECONDARY = os.environ.get("API_KEY_SECONDARY", "")
+# /mcp auth mode: off = no check (legacy), warn = check and record unauthenticated callers on the
+# bus but allow them, enforce = 401. Any other value fails safe to warn, never silently to off.
+MCP_AUTH_MODE = os.environ.get("MCP_AUTH_MODE", "warn").strip().lower()
+if MCP_AUTH_MODE not in ("off", "warn", "enforce"):
+    logger.warning("MCP_AUTH_MODE=%r is not off|warn|enforce; using warn", MCP_AUTH_MODE)
+    MCP_AUTH_MODE = "warn"
+GW_VERSION          = "3.2.0"
 
 # S1409: Last-known session_key for context telemetry.
 # Tools like platform_search don't carry session_key in arguments.
@@ -79,6 +90,84 @@ _bg_tasks: set = set()  # retained refs for fire-and-forget asyncio tasks -- an
 # ever runs (sTR #17/#55-A pattern); .discard on completion keeps this bounded.
 GCLOUD_RUNNER_URL   = os.environ.get("GCLOUD_RUNNER_URL", "https://miller-gcloud-runner-146372550543.us-central1.run.app")
 GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
+
+# == § 003b  KEY AUTH (Bug 52545: dual-key acceptance + /mcp gate) ================
+# One enforcement point for every key-guarded route (/execute, /admin/*, /mcp).
+#   _key_match(presented)  -> "current" | "secondary" | ""   (constant-time, fails closed)
+#   _auth_gate(request, route, ...) -> True when the request may proceed
+# Every secondary/invalid/absent-key request leaves a bus row (log_audit_event), deduped per
+# caller signature per hour, so "who still uses the old key" is a query, not a guess.
+# The presented key is never logged or stored.
+_MIN_KEY_LEN = 16
+_AUTH_EVENT_TTL_S = 3600
+_auth_events_seen: dict = {}
+if len(API_KEY) < _MIN_KEY_LEN:
+    logger.error("API_KEY missing or shorter than %d chars -- key-guarded routes will fail closed", _MIN_KEY_LEN)
+
+
+def _key_match(presented: str) -> str:
+    if not presented:
+        return ""
+    p = presented.encode("utf-8", "ignore")
+    matched = ""
+    # No early exit: every candidate is compared, each in constant time.
+    for label, key in (("current", API_KEY), ("secondary", API_KEY_SECONDARY)):
+        if len(key) >= _MIN_KEY_LEN and hmac.compare_digest(p, key.encode("utf-8")):
+            matched = matched or label
+    return matched
+
+
+def _presented_key(request: Request, allow_query: bool = False) -> str:
+    key = request.headers.get("x-api-key", "")
+    if not key:
+        auth = request.headers.get("authorization", "")
+        if auth[:7].lower() == "bearer ":
+            key = auth[7:].strip()
+    if not key and allow_query:
+        key = request.query_params.get("api_key", "")
+    return key
+
+
+async def _emit_auth_event(event_type: str, data: dict) -> None:
+    try:
+        await _proxy(
+            "log_audit_event",
+            {"event_type": event_type, "entity_type": "gateway_auth",
+             "entity_id": "miller-mcp-gateway", "data": data},
+            str(uuid.uuid4()),
+        )
+    except Exception as exc:  # the bus write must never break or block the request
+        logger.warning("auth_event_write_failed type=%s err=%s", event_type, exc)
+
+
+def _record_auth_event(request: Request, route: str, state: str, mode: str) -> None:
+    ua = request.headers.get("user-agent", "")[:120]
+    origin = request.headers.get("origin", "")[:120]
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()[:64]
+    sig = f"{route}|{state}|{ua}|{origin}|{ip}"
+    now = time.monotonic()
+    last = _auth_events_seen.get(sig)
+    if last is not None and now - last < _AUTH_EVENT_TTL_S:
+        return
+    if len(_auth_events_seen) > 512:
+        _auth_events_seen.clear()
+    _auth_events_seen[sig] = now
+    logger.warning("gateway_auth route=%s state=%s mode=%s ua=%r origin=%r ip=%s", route, state, mode, ua, origin, ip)
+    task = asyncio.create_task(_emit_auth_event(
+        "gateway_auth_" + state,
+        {"route": route, "state": state, "mode": mode, "user_agent": ua,
+         "origin": origin, "ip": ip, "gateway_version": GW_VERSION},
+    ))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def _auth_gate(request: Request, route: str, *, allow_query: bool = False, mode: str = "enforce") -> bool:
+    presented = _presented_key(request, allow_query)
+    matched = _key_match(presented)
+    if matched != "current":
+        _record_auth_event(request, route, matched or ("invalid" if presented else "absent"), mode)
+    return bool(matched) or mode != "enforce"
 
 # == § 004  UUID DISCOVERY =====================================================
 # _extract_uuid_from_headers: scans incoming MCP headers for Claude UUID.
@@ -1110,6 +1199,10 @@ async def mcp_post(request: Request) -> Response:
     #   3. Forwarding — pass anthropic-/x-claude-/referer to db-v3 as X-Upstream-*
     raw_hdrs = dict(request.headers)
     _upstream_hdrs.set(raw_hdrs)
+    # Bug 52545: /mcp gate. off = legacy no-check; warn = record unauthenticated callers, allow;
+    # enforce = 401. Credential via X-API-Key, Authorization: Bearer, or ?api_key= (connector URLs).
+    if MCP_AUTH_MODE != "off" and not _auth_gate(request, "/mcp", allow_query=True, mode=MCP_AUTH_MODE):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
     _interesting = {
         k: v for k, v in raw_hdrs.items()
         if any(k.lower().startswith(p) for p in (
@@ -1187,8 +1280,7 @@ async def rest_execute(request: Request) -> Response:
     REST passthrough — proxies directly to db-v3 /execute.
     Preserves backward compatibility for any non-MCP callers.
     """
-    api_key = request.headers.get("x-api-key", "")
-    if api_key != API_KEY:
+    if not _auth_gate(request, "/execute"):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     try:
         body = await request.json()
@@ -1242,8 +1334,7 @@ async def admin_restart(service: str, request: Request) -> JSONResponse:
     Bypasses db-v3 entirely -- routes through miller-gcloud-runner only.
     Example: curl -X POST https://<gateway>/admin/restart/miller-mcp-db-v3 -H 'X-API-Key: <key>'
     """
-    api_key = request.headers.get("x-api-key", "")
-    if api_key != API_KEY:
+    if not _auth_gate(request, "/admin/restart"):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     result = await _handle_restart_service({"service": service})
     return JSONResponse(

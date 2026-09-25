@@ -73,6 +73,15 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-platform-api-key
+        # Bug 52545: dual-key acceptance. Holds "unset" outside a rotation window (see rotation runbook).
+        - name: API_KEY_SECONDARY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-platform-api-key-secondary
+        # Bug 52545: /mcp gate mode: off | warn | enforce. Flip to enforce only after the connector carries a credential.
+        - name: MCP_AUTH_MODE
+          value: warn
         - name: RUNNER_MASTER_SECRET
           valueFrom:
             secretKeyRef:
