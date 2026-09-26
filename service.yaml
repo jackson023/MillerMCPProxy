@@ -80,7 +80,7 @@ spec:
               key: latest
               name: miller-platform-api-key-secondary
         - name: MCP_AUTH_MODE
-          value: enforce
+          value: warn
         - name: RUNNER_MASTER_SECRET
           valueFrom:
             secretKeyRef:
