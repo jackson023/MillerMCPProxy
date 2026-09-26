@@ -79,9 +79,8 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-platform-api-key-secondary
-        # Bug 52545: /mcp gate mode: off | warn | enforce. Flip to enforce only after the connector carries a credential.
         - name: MCP_AUTH_MODE
-          value: warn
+          value: enforce
         - name: RUNNER_MASTER_SECRET
           valueFrom:
             secretKeyRef:
