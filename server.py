@@ -449,8 +449,55 @@ async def _handle_ping(_args: dict) -> dict:
     }
 
 
+async def _probe_dispatch() -> dict:
+    """Gate 3 (2026-10-21 db-v3 lockup): one REAL tool call through db-v3 /execute.
+
+    db-v3 /health answered in ~45ms during the lockup while every tool call hung for
+    120s, because /health never touches _dispatch or the connection pool. This posts
+    dispatch_health_probe (auth + _dispatch + tool load + pool checkout + SELECT 1)
+    with an 8s budget. A timeout here is the same failure class _proxy already counts,
+    so it is recorded on the circuit breaker; success is NOT recorded, so a passing
+    probe can never mask real tool failures by resetting the failure count.
+    """
+    t0 = time.monotonic()
+    out: dict = {"tool": "dispatch_health_probe", "status": "unknown"}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+            r = await client.post(
+                DB_V3_EXECUTE,
+                json={"tool_name": "dispatch_health_probe", "arguments": {"budget_ms": 3000}},
+                headers={"X-API-Key": API_KEY, "X-Gateway-Version": GW_VERSION,
+                         "Content-Type": "application/json"},
+            )
+        out["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        if r.status_code != 200:
+            out["status"] = f"http_{r.status_code}"
+            return out
+        body = r.json() if r.content else {}
+        res = body.get("result", body) if isinstance(body, dict) else {}
+        if not isinstance(res, dict):
+            res = {}
+        out["status"] = res.get("status", "unknown")
+        for _k in ("acquire_ms", "query_ms", "total_ms", "error"):
+            if res.get(_k) is not None:
+                out[_k] = res[_k]
+    except httpx.TimeoutException:
+        out["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        out["status"] = "timeout"
+        _circuit.record_failure()
+    except Exception as exc:
+        out["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        out["status"] = f"error:{type(exc).__name__}"
+    return out
+
+
 async def _handle_gateway_status(_args: dict) -> dict:
-    """Probes db-v3 /health and returns full gateway diagnostic state."""
+    """Probes db-v3 /health AND a real tool dispatch; reports the truth.
+
+    overall is 'healthy' only when /health is up AND the dispatch probe returns ok.
+    'degraded' = dispatch works but slowly. 'down' = dispatch fails or times out
+    (the 2026-10-21 shape: /health green, tools hanging).
+    """
     db_v3_status              = "unknown"
     db_v3_tools: int | None   = None
     db_v3_latency_ms: int | None = None
@@ -471,7 +518,16 @@ async def _handle_gateway_status(_args: dict) -> dict:
     except Exception as exc:
         db_v3_latency_ms = round((time.monotonic() - t0) * 1000)
         db_v3_status = f"error:{type(exc).__name__}"
+    dispatch = await _probe_dispatch()
+    _health_up = db_v3_status in ("ok", "healthy")
+    if _health_up and dispatch.get("status") == "ok":
+        overall = "healthy"
+    elif _health_up and dispatch.get("status") == "degraded":
+        overall = "degraded"
+    else:
+        overall = "down"
     return {
+        "overall": overall,
         "gateway": {
             "version": GW_VERSION,
             "status":  "healthy",
@@ -483,6 +539,7 @@ async def _handle_gateway_status(_args: dict) -> dict:
             "status":       db_v3_status,
             "tools_loaded": db_v3_tools,
             "latency_ms":   db_v3_latency_ms,
+            "dispatch":     dispatch,
         },
     }
 
