@@ -36,6 +36,7 @@ Components:
 # § 012  Routes (/mcp POST, /mcp GET, /execute passthrough, /health)
 # ==============================================================================
 import asyncio
+import datetime
 import hmac
 import json
 import logging
@@ -104,10 +105,11 @@ _WT_IN_FLUSH: _ContextVar[bool] = _ContextVar("_WT_IN_FLUSH", default=False)   #
 _work_ticket.set_reader(lambda: (_gw_ticket.get() or {}).get("trace_id"))
 _W3C_TP_RE = _re.compile(r"^[0-9a-f]{2}-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
 _HEX32_RE = _re.compile(r"^(?!0{32})[0-9a-f]{32}$")
+_HEX16_RE = _re.compile(r"^(?!0{16})[0-9a-f]{16}$")
 
 
 def _wt_new() -> dict:
-    return {"trace_id": os.urandom(16).hex(), "span_id": os.urandom(8).hex()}
+    return {"trace_id": os.urandom(16).hex(), "span_id": os.urandom(8).hex(), "parent_span_id": None}
 
 
 def _wt_trace_id() -> str:
@@ -122,15 +124,72 @@ def _wt_ticket_from_headers(headers, path: str) -> dict:
     if not path.startswith("/mcp"):
         _x = (headers.get("x-trace-id") or "").strip().lower().replace("-", "")
         if _HEX32_RE.match(_x):
-            return {"trace_id": _x, "span_id": os.urandom(8).hex()}
+            return {"trace_id": _x, "span_id": os.urandom(8).hex(), "parent_span_id": None}
         _m = _W3C_TP_RE.match((headers.get("traceparent") or "").strip().lower())
         if _m and _HEX32_RE.match(_m.group(1)):
-            return {"trace_id": _m.group(1), "span_id": _m.group(2)}
+            # the door is its own span, a child of the caller's. Cloud Run rewrites the traceparent parent-id on
+            # every hop, so the caller's real span travels in X-Miller-Span (set by our own services).
+            _xs = (headers.get("x-miller-span") or "").strip().lower()
+            return {"trace_id": _m.group(1), "span_id": os.urandom(8).hex(),
+                    "parent_span_id": _xs if _HEX16_RE.match(_xs) else _m.group(2)}
     return _wt_new()
 
 
+# -- Spans: the gateway leg of every trace (platform_trace_timeline) ----------------------------------------------
+# One span per request at the door and one per outbound call, so a trace reads Claude -> gateway -> db-v3 -> ... as
+# one tree. Each outbound hand-off is its own span: its id goes out as the traceparent parent-id AND as X-Miller-Span
+# (Cloud Run rewrites the traceparent parent-id on every hop; db-v3's door reads X-Miller-Span). Spans are buffered
+# (bounded, oldest dropped and counted) and sent every few seconds through db-v3 /execute -> gateway_span_ingest.
+_WT_SPANS: list = []
+_WT_SPANS_MAX = 5000
+_WT_SPAN_BATCH = 500
+_WT_SPAN_EVERY_S = 5.0
+_WT_SPANS_DROPPED = [0]
+_WT_SPAN_SKIP_PATHS = frozenset({"/health"})          # liveness probes are not work
+_WT_TOOL_RE = _re.compile(rb'"tool_name"\s*:\s*"([A-Za-z0-9_.:\-]{1,120})"')
+
+
+def _wt_iso(epoch_s: float) -> str:
+    return datetime.datetime.fromtimestamp(epoch_s, datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _wt_span_add(span: dict) -> None:
+    if len(_WT_SPANS) >= _WT_SPANS_MAX:
+        del _WT_SPANS[0]
+        _WT_SPANS_DROPPED[0] += 1
+    _WT_SPANS.append(span)
+
+
+def _wt_caller(path: str, status) -> str:
+    """The caller label for the gateway's spans: the MCP door is 'mcp'; the key-guarded REST routes are
+    'direct_api_key' (db-v3 uses the same label for key auth); a request the auth gate refused stays 'unattributed'."""
+    if status == 401:
+        return "unattributed"
+    return "mcp" if path.startswith("/mcp") else "direct_api_key"
+
+
+def _wt_dest(host: str) -> str:
+    if host.startswith("miller-mcp-db-v3"):
+        return "db-v3"
+    if host.startswith("miller-gcloud-runner"):
+        return "gcloud-runner"
+    if host.endswith(".run.app"):
+        return host.split(".")[0][:60]
+    return host[:60] or "unknown"
+
+
+def _wt_label(tool_name: str | None = None, rpc: str | None = None) -> None:
+    """Name what this request is doing (the JSON-RPC method, the real tool after meta_tool unwrap) on its door span."""
+    _t = _gw_ticket.get()
+    if isinstance(_t, dict):
+        if tool_name and not _t.get("tool"):
+            _t["tool"] = str(tool_name)[:120]
+        if rpc and not _t.get("rpc"):
+            _t["rpc"] = str(rpc)[:60]
+
+
 class _WorkTicketDoor:
-    """Pure ASGI, outermost: every HTTP request gets its ticket before any route code runs."""
+    """Pure ASGI, outermost: every HTTP request gets its ticket before any route code runs, and its door span."""
 
     def __init__(self, app):
         self.app = app
@@ -139,36 +198,106 @@ class _WorkTicketDoor:
         if scope.get("type") not in ("http", "websocket"):
             return await self.app(scope, receive, send)
         _tok = None
+        _ticket = None
+        _t0 = time.time()
+        _m0 = time.monotonic()
+        _status = [None]
         try:
             _hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or ()}
-            _tok = _gw_ticket.set(_wt_ticket_from_headers(_hdrs, scope.get("path") or ""))
+            _ticket = _wt_ticket_from_headers(_hdrs, scope.get("path") or "")
+            _ticket["path"] = (scope.get("path") or "")[:200]
+            _tok = _gw_ticket.set(_ticket)
         except Exception:
             _tok = None
+
+        async def _send(message):
+            if message.get("type") == "http.response.start":
+                _status[0] = message.get("status")
+            await send(message)
+
         try:
-            return await self.app(scope, receive, send)
+            return await self.app(scope, receive, _send)
         finally:
             if _tok is not None:
                 _gw_ticket.reset(_tok)
+            try:
+                _path = scope.get("path") or ""
+                if _ticket and scope.get("type") == "http" and _path not in _WT_SPAN_SKIP_PATHS:
+                    _code = _status[0]
+                    _op = f"{scope.get('method') or 'GET'} {_path}"[:100]
+                    if _ticket.get("rpc"):
+                        _op = f"{_op} {_ticket['rpc']}"
+                    _wt_span_add({
+                        "trace_id": _ticket["trace_id"], "span_id": _ticket["span_id"],
+                        "parent_span_id": _ticket.get("parent_span_id"), "service": "gateway",
+                        "operation": _op, "tool": _ticket.get("tool"),
+                        "status": "ok" if _code is not None and _code < 400 else "error",
+                        "caller_source": _wt_caller(_path, _code),
+                        "start": _wt_iso(_t0), "end": _wt_iso(_t0 + (time.monotonic() - _m0)),
+                        "attrs": {"path": _path[:200], "http_status": _code if _code is not None else 0,
+                                  **({"rpc": _ticket["rpc"]} if _ticket.get("rpc") else {})},
+                    })
+            except Exception:
+                pass
 
 
 _ORIG_HTTPX_SEND = httpx.AsyncClient.send
 
 
 async def _wt_send(self, request, *args, **kwargs):
-    """Every outbound request is a compute grant; hand-offs to our own services carry the ticket as traceparent."""
+    """Every outbound request is a compute grant and a span; hand-offs to our own services carry the ticket as
+    traceparent + X-Miller-Span (the hand-off's own span id)."""
+    _rec = None
     try:
         if not _WT_IN_FLUSH.get():
             _h = (request.url.host or "").lower()
             _gp = _work_ticket.http_point(_h, request.url.path)
             if _gp:
                 _work_ticket.grant(_gp, lambda: f"host:{_h}")
-            if _h.endswith(".run.app") and "traceparent" not in request.headers:
-                _t = _gw_ticket.get() or {}
-                if _HEX32_RE.match(str(_t.get("trace_id") or "")):
-                    request.headers["traceparent"] = f"00-{_t['trace_id']}-{_t.get('span_id') or os.urandom(8).hex()}-01"
+            _t = _gw_ticket.get() or {}
+            if _gp and _HEX32_RE.match(str(_t.get("trace_id") or "")):
+                _cs = os.urandom(8).hex()
+                if _h.endswith(".run.app") and "traceparent" not in request.headers:
+                    request.headers["traceparent"] = f"00-{_t['trace_id']}-{_cs}-01"
+                    request.headers["x-miller-span"] = _cs
+                _tool = None
+                if _h.endswith(".run.app"):
+                    try:
+                        _tm = _WT_TOOL_RE.search(bytes(request.content[:2048]))
+                        _tool = _tm.group(1).decode("ascii") if _tm else None
+                    except Exception:
+                        _tool = None            # a streamed body is not read here
+                _rec = {"trace_id": _t["trace_id"], "span_id": _cs, "parent_span_id": _t.get("span_id"),
+                        "dest": _wt_dest(_h), "host": _h, "path": request.url.path, "method": request.method,
+                        "tool": _tool, "t0": time.time(), "m0": time.monotonic(),
+                        "caller": "boot" if _t.get("entry") == "boot" else _wt_caller(_t.get("path") or "", None)}
     except Exception:
-        pass
-    return await _ORIG_HTTPX_SEND(self, request, *args, **kwargs)
+        _rec = None
+    _code = None
+    _err = None
+    try:
+        _resp = await _ORIG_HTTPX_SEND(self, request, *args, **kwargs)
+        _code = _resp.status_code
+        return _resp
+    except BaseException as exc:
+        _err = type(exc).__name__
+        raise
+    finally:
+        if _rec is not None:
+            try:
+                _wt_span_add({
+                    "trace_id": _rec["trace_id"], "span_id": _rec["span_id"],
+                    "parent_span_id": _rec["parent_span_id"], "service": _rec["dest"],
+                    "operation": f"{_rec['method']} {_rec['path']}"[:120], "tool": _rec["tool"],
+                    "status": "ok" if _code is not None and _code < 400 else "error",
+                    "caller_source": _rec["caller"],
+                    "start": _wt_iso(_rec["t0"]), "end": _wt_iso(_rec["t0"] + (time.monotonic() - _rec["m0"])),
+                    "attrs": {"url_host": _rec["host"][:200], "url_path": str(_rec["path"])[:200],
+                              "method": _rec["method"], "http_status": _code or 0,
+                              **({"error": _err} if _err else {})},
+                })
+            except Exception:
+                pass
 
 
 httpx.AsyncClient.send = _wt_send
@@ -194,6 +323,55 @@ async def _wt_write(minute, runtime, points, sites, totals, misses) -> None:
 async def _wt_flush_loop() -> None:
     _WT_IN_FLUSH.set(True)   # this task only: its own posts are the books, not work
     await _work_ticket.flush_loop_with(_wt_write)
+
+
+async def _wt_span_write(spans: list) -> None:
+    """Send one batch of spans to db-v3 (gateway_span_ingest). Raises on any failure so the caller keeps them."""
+    payload = {"tool_name": "gateway_span_ingest", "arguments": {"spans": spans}}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+        r = await client.post(DB_V3_EXECUTE, json=payload, headers={"X-API-Key": API_KEY,
+                                                                    "Content-Type": "application/json"})
+    if r.status_code != 200:
+        raise RuntimeError(f"gateway_span_ingest HTTP {r.status_code}")
+    _body = r.json()
+    _inner = _body.get("result", _body) if isinstance(_body, dict) else {}
+    if (isinstance(_body, dict) and _body.get("status") == "error") or \
+            (isinstance(_inner, dict) and _inner.get("status") == "error"):
+        raise RuntimeError(f"gateway_span_ingest refused: {str(_body)[:200]}")
+    if isinstance(_inner, dict) and _inner.get("rejected"):
+        logger.warning("gateway_span_ingest rejected %s span(s): %s", _inner.get("rejected"), _inner.get("rejects"))
+
+
+async def _wt_span_flush() -> int:
+    """Send everything buffered, one batch at a time. A failed batch goes back to the front of the buffer (still
+    bounded by _WT_SPANS_MAX), so a db-v3 blip loses nothing that fits."""
+    sent = 0
+    while _WT_SPANS:
+        batch = _WT_SPANS[:_WT_SPAN_BATCH]
+        del _WT_SPANS[:len(batch)]
+        try:
+            await _wt_span_write(batch)
+        except Exception as exc:
+            _WT_SPANS[:0] = batch[: max(0, _WT_SPANS_MAX - len(_WT_SPANS))]
+            logger.warning("gateway span flush failed (%d kept for next flush): %r", len(batch), exc)
+            break
+        sent += len(batch)
+    if _WT_SPANS_DROPPED[0]:
+        logger.warning("gateway span buffer full: %d oldest span(s) dropped", _WT_SPANS_DROPPED[0])
+        _WT_SPANS_DROPPED[0] = 0
+    return sent
+
+
+async def _wt_span_loop() -> None:
+    _WT_IN_FLUSH.set(True)   # this task only: sending the spans is not itself work to record
+    while True:
+        await asyncio.sleep(_WT_SPAN_EVERY_S)
+        try:
+            await _wt_span_flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("gateway span loop: %r", exc)
 
 # == § 003b  KEY AUTH (Bug 52545: dual-key acceptance + /mcp gate) ================
 # One enforcement point for every key-guarded route (/execute, /admin/*, /mcp).
@@ -872,6 +1050,9 @@ async def _startup() -> None:
     _wt_task = asyncio.create_task(_wt_flush_loop())
     _bg_tasks.add(_wt_task)
     _wt_task.add_done_callback(_bg_tasks.discard)
+    _wt_span_task = asyncio.create_task(_wt_span_loop())
+    _bg_tasks.add(_wt_span_task)
+    _wt_span_task.add_done_callback(_bg_tasks.discard)
     logger.info(
         "Miller MCP Gateway v%s — stateless proxy mode. db-v3: %s",
         GW_VERSION, DB_V3_URL,
@@ -1237,6 +1418,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                 "isError": True,
             })
 
+    _wt_label(tool_name=tool_name)   # the real tool (after meta_tool unwrap) names this request's door span
     try:
         # Local handlers: ping and gateway_status never leave the gateway container
         if tool_name in _LOCAL_HANDLERS:
@@ -1340,6 +1522,7 @@ async def _handle_single(msg: dict) -> dict | None:
     handler = handlers.get(method)
     if handler is None:
         return _err(req_id, -32601, f"Method not found: {method}")
+    _wt_label(rpc=method)
     try:
         if asyncio.iscoroutinefunction(handler):
             return await handler(params, req_id)
@@ -1367,6 +1550,10 @@ async def _wt_shutdown() -> None:
         await asyncio.wait_for(_work_ticket.flush_with(_wt_write), timeout=5.0)
     except Exception as exc:
         logger.warning("work_ticket final flush failed: %s", exc)
+    try:
+        await asyncio.wait_for(_wt_span_flush(), timeout=5.0)
+    except Exception as exc:
+        logger.warning("gateway final span flush failed: %s", exc)
 
 
 @app.post("/mcp")
@@ -1473,6 +1660,7 @@ async def rest_execute(request: Request) -> Response:
     if _unwrap_err:
         return JSONResponse(status_code=400, content={"error": _unwrap_err})
     trace_id = _wt_trace_id()   # [decision] #51749: inherited from our caller or minted at the door
+    _wt_label(tool_name=tool_name)
     try:
         result = await _proxy(tool_name, arguments, trace_id)
         return JSONResponse(content=result)
