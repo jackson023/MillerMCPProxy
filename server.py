@@ -91,6 +91,110 @@ _bg_tasks: set = set()  # retained refs for fire-and-forget asyncio tasks -- an
 GCLOUD_RUNNER_URL   = os.environ.get("GCLOUD_RUNNER_URL", "https://miller-gcloud-runner-146372550543.us-central1.run.app")
 GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
 
+# == § 003a  WORK TICKETS ([decision] #51749) ===================================
+# The gateway is the door every Claude tool call comes through. A work ticket (the trace id) is minted here for each
+# request (_WorkTicketDoor, outermost), carried to our services as a W3C traceparent, and every outbound call is
+# counted as a compute grant (one enforcement point: httpx.AsyncClient.send, process-wide). The gateway has no
+# database: counts are flushed once a minute through db-v3 /execute -> work_ticket_ingest (runtime 'gateway').
+import work_ticket as _work_ticket  # noqa: E402
+
+_work_ticket.RUNTIME = "gateway"
+_gw_ticket: _ContextVar[dict] = _ContextVar("_gw_ticket", default={})
+_WT_IN_FLUSH: _ContextVar[bool] = _ContextVar("_WT_IN_FLUSH", default=False)   # the books themselves are not work
+_work_ticket.set_reader(lambda: (_gw_ticket.get() or {}).get("trace_id"))
+_W3C_TP_RE = _re.compile(r"^[0-9a-f]{2}-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
+_HEX32_RE = _re.compile(r"^(?!0{32})[0-9a-f]{32}$")
+
+
+def _wt_new() -> dict:
+    return {"trace_id": os.urandom(16).hex(), "span_id": os.urandom(8).hex()}
+
+
+def _wt_trace_id() -> str:
+    """The current request's ticket (32 hex). Every place that used to mint its own uuid4 uses this instead."""
+    return (_gw_ticket.get() or {}).get("trace_id") or os.urandom(16).hex()
+
+
+def _wt_ticket_from_headers(headers, path: str) -> dict:
+    """X-Trace-Id (32 hex or a UUID) or a valid traceparent from one of OUR callers is inherited; otherwise mint.
+    On /mcp the inbound traceparent is Anthropic's per-turn trace (kept as _anthropic_trace_id by tools/call),
+    never our ticket: each MCP request gets its own."""
+    if not path.startswith("/mcp"):
+        _x = (headers.get("x-trace-id") or "").strip().lower().replace("-", "")
+        if _HEX32_RE.match(_x):
+            return {"trace_id": _x, "span_id": os.urandom(8).hex()}
+        _m = _W3C_TP_RE.match((headers.get("traceparent") or "").strip().lower())
+        if _m and _HEX32_RE.match(_m.group(1)):
+            return {"trace_id": _m.group(1), "span_id": _m.group(2)}
+    return _wt_new()
+
+
+class _WorkTicketDoor:
+    """Pure ASGI, outermost: every HTTP request gets its ticket before any route code runs."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        _tok = None
+        try:
+            _hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or ()}
+            _tok = _gw_ticket.set(_wt_ticket_from_headers(_hdrs, scope.get("path") or ""))
+        except Exception:
+            _tok = None
+        try:
+            return await self.app(scope, receive, send)
+        finally:
+            if _tok is not None:
+                _gw_ticket.reset(_tok)
+
+
+_ORIG_HTTPX_SEND = httpx.AsyncClient.send
+
+
+async def _wt_send(self, request, *args, **kwargs):
+    """Every outbound request is a compute grant; hand-offs to our own services carry the ticket as traceparent."""
+    try:
+        if not _WT_IN_FLUSH.get():
+            _h = (request.url.host or "").lower()
+            _gp = _work_ticket.http_point(_h, request.url.path)
+            if _gp:
+                _work_ticket.grant(_gp, lambda: f"host:{_h}")
+            if _h.endswith(".run.app") and "traceparent" not in request.headers:
+                _t = _gw_ticket.get() or {}
+                if _HEX32_RE.match(str(_t.get("trace_id") or "")):
+                    request.headers["traceparent"] = f"00-{_t['trace_id']}-{_t.get('span_id') or os.urandom(8).hex()}-01"
+    except Exception:
+        pass
+    return await _ORIG_HTTPX_SEND(self, request, *args, **kwargs)
+
+
+httpx.AsyncClient.send = _wt_send
+
+
+async def _wt_write(minute, runtime, points, sites, totals, misses) -> None:
+    """flush_with writer: the gateway's counts go to platform_work_ticket_grants through db-v3."""
+    payload = {"tool_name": "work_ticket_ingest", "arguments": {
+        "minute": minute.isoformat(), "runtime": runtime, "points": points, "sites": sites,
+        "totals": totals, "misses": misses}}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+        r = await client.post(DB_V3_EXECUTE, json=payload, headers={"X-API-Key": API_KEY,
+                                                                    "Content-Type": "application/json"})
+    if r.status_code != 200:
+        raise RuntimeError(f"work_ticket_ingest HTTP {r.status_code}")
+    _body = r.json()
+    _inner = _body.get("result", _body) if isinstance(_body, dict) else {}
+    if (isinstance(_body, dict) and _body.get("status") == "error") or \
+            (isinstance(_inner, dict) and _inner.get("status") == "error"):
+        raise RuntimeError(f"work_ticket_ingest refused: {str(_body)[:200]}")
+
+
+async def _wt_flush_loop() -> None:
+    _WT_IN_FLUSH.set(True)   # this task only: its own posts are the books, not work
+    await _work_ticket.flush_loop_with(_wt_write)
+
 # == § 003b  KEY AUTH (Bug 52545: dual-key acceptance + /mcp gate) ================
 # One enforcement point for every key-guarded route (/execute, /admin/*, /mcp).
 #   _key_match(presented)  -> "current" | "secondary" | ""   (constant-time, fails closed)
@@ -133,7 +237,7 @@ async def _emit_auth_event(event_type: str, data: dict) -> None:
     payload = {"event_type": event_type, "entity_type": "gateway_auth",
                "data": dict(data, gateway="miller-mcp-gateway")}
     try:
-        res = await _proxy("log_audit_event", payload, str(uuid.uuid4()))
+        res = await _proxy("log_audit_event", payload, _wt_trace_id())
     except Exception as exc:  # the bus write must never break or block the request
         logger.warning("auth_event_write_failed type=%s err=%s", event_type, exc)
         return
@@ -613,8 +717,7 @@ async def _handle_code_edit(arguments: dict) -> Any:
     Handles: single-op (params={}), batch-ops (ops=[...]).
     Pass-through: tools_ops=, tools='all' (complex batch, handled in db-v3).
     """
-    import uuid as _uuid
-    _trace = str(_uuid.uuid4())
+    _trace = _wt_trace_id()   # [decision] #51749: the request's ticket, not a fresh id
     session_key = (arguments or {}).get("session_key", "")
     args = dict(arguments or {})
     _STAGE_FIELDS = ("find", "end_find", "new_src")
@@ -759,10 +862,16 @@ async def _proxy(tool_name: str, arguments: dict, trace_id: str) -> Any:
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Miller MCP Gateway", version=GW_VERSION, docs_url=None, redoc_url=None)
+app.add_middleware(_WorkTicketDoor)   # [decision] #51749: outermost -- the ticket exists before any route runs
 
 
 @app.on_event("startup")
 async def _startup() -> None:
+    # [decision] #51749: boot is an entry point (startup probes, circuit seeding); then start the minute flusher.
+    _gw_ticket.set({**_wt_new(), "entry": "boot"})
+    _wt_task = asyncio.create_task(_wt_flush_loop())
+    _bg_tasks.add(_wt_task)
+    _wt_task.add_done_callback(_bg_tasks.discard)
     logger.info(
         "Miller MCP Gateway v%s — stateless proxy mode. db-v3: %s",
         GW_VERSION, DB_V3_URL,
@@ -933,7 +1042,7 @@ async def _fire_context_telemetry(sk: str, tn: str, req_text: str, resp_text: st
 async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
-    trace_id  = str(uuid.uuid4())
+    trace_id  = _wt_trace_id()   # [decision] #51749: the door's ticket for this MCP request
 
     # arguments may arrive as a JSON string from MCP serialization
     if isinstance(arguments, str):
@@ -1250,6 +1359,16 @@ async def _handle_single(msg: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+@app.on_event("shutdown")
+async def _wt_shutdown() -> None:
+    """[decision] #51749: last flush before the instance goes away, so its final minute of counts is not lost."""
+    _WT_IN_FLUSH.set(True)
+    try:
+        await asyncio.wait_for(_work_ticket.flush_with(_wt_write), timeout=5.0)
+    except Exception as exc:
+        logger.warning("work_ticket final flush failed: %s", exc)
+
+
 @app.post("/mcp")
 async def mcp_post(request: Request) -> Response:
     # ── Enterprise header capture ─────────────────────────────────────────
@@ -1353,7 +1472,7 @@ async def rest_execute(request: Request) -> Response:
     tool_name, arguments, _unwrap_err = _unwrap_meta_tool_rest(tool_name, arguments)
     if _unwrap_err:
         return JSONResponse(status_code=400, content={"error": _unwrap_err})
-    trace_id = str(uuid.uuid4())
+    trace_id = _wt_trace_id()   # [decision] #51749: inherited from our caller or minted at the door
     try:
         result = await _proxy(tool_name, arguments, trace_id)
         return JSONResponse(content=result)
