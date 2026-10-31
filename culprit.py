@@ -255,7 +255,7 @@ _OUTCOME_CLASSES = (
     ("policy_block", re.compile(
         r"BLOCKED|\bwould_block\b|not read this session|No research receipt found|\bGATE_\d+:|^Tool '[^']+' is disabled"
         r"|\brecipe_mock_gate\b|different caller prefix|fix before committing|refusing to run"
-        r"|is not (?:accepted|honored) for type")),
+        r"|is not (?:accepted|honored) for type|^no authenticated person on this request; refusing$")),
     ("input_validation", re.compile(
         r"\bis required\b|\bmust be one of\b|\brequired for type\b|^One of: \w+=|\btype=\S+ requires\b"
         r"|\bold_str matches \d+ locations?\b|\bmust be unique\b")),
@@ -273,6 +273,47 @@ _OUTCOME_CLASSES = (
     # a workflow certification verdict (assertions did not pass), relayed by the caller as text
     ("verdict_not_certified", re.compile(r"\"certified\": false, \"verdict\": \"(?:failed|uncertain)\"")),
 )
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _http_result_statements(tree: ast.AST, result: Any) -> dict[int, dict[int, str]]:
+    """[bug] #64776: the statement that BUILT a bare-status HTTP result: a dict that carries the same status_code constant
+    AND an html literal (>= 24 chars) that is inside the result's html. Both must hold, so a router that only relays the
+    callee's page, or builds its own error page from a variable, matches nothing. Same shape as the literal match:
+    {id(statement): {literal line: literal}}."""
+    if not isinstance(result, dict) or not isinstance(result.get("html"), str) or result.get("status_code") is None:
+        return {}
+    html, sc = result["html"], str(result["status_code"])
+    out: dict[int, dict[int, str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Return, ast.Assign)):
+            continue
+        for d in (n for n in ast.walk(node) if isinstance(n, ast.Dict)):
+            kv = {k.value: v for k, v in zip(d.keys, d.values) if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            code_v = kv.get("status_code")
+            if not (isinstance(code_v, ast.Constant) and str(code_v.value) == sc and "html" in kv):
+                continue
+            for c in ast.walk(kv["html"]):
+                if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                    s = c.value.strip()
+                    if len(s) >= 24 and s in html:
+                        out.setdefault(id(node), {}).setdefault(c.lineno, s)
+    return out
+
+
+def result_fingerprint(result: Any) -> str | None:
+    """[bug] #64776: identity of a bare-status HTTP result (the error text is only 'status=error', so the text cannot say
+    which failure it is). A caller that returns the callee's page unchanged carries the same fingerprint, so it can name
+    the callee's line. None for anything with real error text or without a page."""
+    texts = _result_texts(result)
+    if not isinstance(result, dict) or not texts or not all(_BARE_STATUS_RE.match(t.strip()) for t in texts):
+        return None
+    html, sc = result.get("html"), result.get("status_code")
+    if not isinstance(html, str) or len(html) < 40 or sc is None:
+        return None
+    return "fp:" + hashlib.sha256(f"{sc}|{html}".encode("utf-8", "replace")).hexdigest()[:32]
+
+
 _BARE_STATUS_RE = re.compile(r"^status=(?:error|partial)$")
 _RELAY_RE = re.compile(r"^tool reported status=(?:error|partial)")
 _EMPTY_DETAIL_RE = re.compile(r":\s*$")
@@ -339,7 +380,14 @@ def resolve_status_error(code: str | None, result: Any, name: str, version: Any)
             if isinstance(c, ast.Constant) and isinstance(c.value, str):
                 s = c.value.strip()
                 if len(s) >= 6 and s.lower() not in skip and any(s in t for t in texts):
+                    # [bug] #64776: a bare identifier word ('timeline', 'component') is an enum value or a name, not a reason.
+                    # It says nothing about why the call failed unless it IS the whole error text; as a substring of a
+                    # list of valid values it made every other branch of the tool a false candidate.
+                    if _IDENT_RE.fullmatch(s) and not any(s == t.strip() for t in texts):
+                        continue
                     stmts.setdefault(id(node), {}).setdefault(c.lineno, s)
+    if not stmts:  # [bug] #64776: a bare-status HTTP result (html + status_code, no error text) names its builder by what it carries
+        stmts = _http_result_statements(tree, result)
     if len(stmts) == 1:
         found = next(iter(stmts.values()))
         ln = min(found)
