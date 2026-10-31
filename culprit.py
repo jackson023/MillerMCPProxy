@@ -249,12 +249,74 @@ def _result_texts(result: Any) -> list[str]:
     return texts
 
 
+# [bug] #64760: outcomes that are provably NOT a code failure, so they have no traceback to find. Each class names what
+# the evidence is. Used only when the resolver found no single return/raise site, so an exact code site always wins.
+_OUTCOME_CLASSES = (
+    ("policy_block", re.compile(
+        r"BLOCKED|\bwould_block\b|not read this session|No research receipt found|\bGATE_\d+:|^Tool '[^']+' is disabled"
+        r"|\brecipe_mock_gate\b|different caller prefix|fix before committing|refusing to run"
+        r"|is not (?:accepted|honored) for type")),
+    ("input_validation", re.compile(
+        r"\bis required\b|\bmust be one of\b|\brequired for type\b|^One of: \w+=|\btype=\S+ requires\b"
+        r"|\bold_str matches \d+ locations?\b|\bmust be unique\b")),
+    ("reference_not_found", re.compile(r"\bnot found in [a-z_]+|\bnot in the page catalog\b|^Contract not found|^Tool '[^']+' not found")),
+    ("database_statement", re.compile(
+        r"SQL execution failed at statement \d+/\d+|(?:column|relation|table|function) \"[^\"]+\" does not exist"
+        r"|Query timed out after \d+s \(server-side statement_timeout|canceling statement due to"
+        r"|UNION types \w+ and \w+ cannot be matched|operator is not unique: |operator does not exist: |\bcolumn [\w.]+ does not exist"
+        r"|could not determine data type of parameter|invalid input syntax for type \w+|syntax error at or near")),
+    ("precondition_not_met", re.compile(r"\bsession has no \w+ linked\b")),
+    ("timeout_limit", re.compile(r"^Execution timed out after \d+s")),
+    ("partial_progress", re.compile(r"\b\d+/\d+ dispatched\b")),
+    # the callee answered ok / deduplicated: nothing failed, the caller just reports the dispatch as not delivered
+    ("deduplicated_dispatch", re.compile(r"'delivery': 'deduplicated'")),
+    # a workflow certification verdict (assertions did not pass), relayed by the caller as text
+    ("verdict_not_certified", re.compile(r"\"certified\": false, \"verdict\": \"(?:failed|uncertain)\"")),
+)
+_BARE_STATUS_RE = re.compile(r"^status=(?:error|partial)$")
+_RELAY_RE = re.compile(r"^tool reported status=(?:error|partial)")
+_EMPTY_DETAIL_RE = re.compile(r":\s*$")
+_EXC_TEXT_RE = re.compile(r"^[A-Z][A-Za-z]*(?:Error|Exception): ?\S")
+
+
+def traceless_outcome(texts: list[str]) -> dict | None:
+    """{reason, evidence} when the error text is a policy / validation / database-statement / precondition outcome."""
+    for t in texts:
+        for reason, rx in _OUTCOME_CLASSES:
+            m = rx.search(t)
+            if m:
+                return {"reason": reason, "evidence": m.group(0)[:60]}
+    return None
+
+
+def verdict_outcome(result: Any) -> dict | None:
+    """The RESULT itself is a certification verdict (certified is False, verdict failed|uncertain): data failed
+    its assertions, no code failed. Structural, so it holds even when the error text is a bare status."""
+    if isinstance(result, dict) and result.get("certified") is False and result.get("verdict") in ("failed", "uncertain"):
+        return {"reason": "verdict_not_certified", "evidence": f"certified=False verdict={result.get('verdict')}"}
+    return None
+
+
+def unresolved_reason(texts: list[str]) -> str | None:
+    """A stated reason for the texts that carry nothing to match, else None."""
+    if all(_BARE_STATUS_RE.match(t.strip()) for t in texts):
+        return "result_has_no_error_text"
+    if any(_RELAY_RE.match(t.strip()) for t in texts):
+        return "relay_of_callee_error"
+    if any(_EMPTY_DETAIL_RE.search(t) for t in texts):
+        return "empty_detail_after_colon"
+    if any(_EXC_TEXT_RE.match(t.strip()) for t in texts):
+        return "caught_exception_relayed"
+    return None
+
+
 def resolve_status_error(code: str | None, result: Any, name: str, version: Any) -> dict:
     """Resolve a status=error RESULT (no exception) to the line in that version that produced it.
 
     A candidate is a return/raise whose subtree holds a string literal (>= 6 chars, not a bare key)
     that appears inside the result's error text. Exactly one distinct line resolves; none or several
-    is 'unresolved'. Never a guess."""
+    is 'no_traceback' (with a stated reason) when the text is a policy / validation / database-statement / precondition
+    outcome, else 'unresolved' (with a stated 'why'). Never a guess."""
     base = {"status": "unresolved", "kind": "tool_result", "file": f"tools/{name}.py", "version": version,
             "hash": code_hash12(code) if code else None, "frames": []}
     texts = _result_texts(result)
@@ -265,7 +327,8 @@ def resolve_status_error(code: str | None, result: Any, name: str, version: Any)
     except SyntaxError:
         return {**base, "why": "syntax_error"}
     skip = {"error", "status", "message", "detail", "reason", "ok", "success", "result"}
-    lines: dict[int, str] = {}
+    stmts: dict[int, dict[int, str]] = {}  # one entry per return/raise STATEMENT: {literal line: literal}. A multi-line f-string
+    # is ONE statement, so its fragments must not read as several candidates (that was most of 'ambiguous_N').
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Return, ast.Raise)):
             continue
@@ -276,12 +339,21 @@ def resolve_status_error(code: str | None, result: Any, name: str, version: Any)
             if isinstance(c, ast.Constant) and isinstance(c.value, str):
                 s = c.value.strip()
                 if len(s) >= 6 and s.lower() not in skip and any(s in t for t in texts):
-                    lines.setdefault(c.lineno, s)
-    if len(lines) == 1:
-        ln = next(iter(lines))
+                    stmts.setdefault(id(node), {}).setdefault(c.lineno, s)
+    if len(stmts) == 1:
+        found = next(iter(stmts.values()))
+        ln = min(found)
         return {**base, "status": "resolved", "line": ln, "function": _enclosing_function(tree, ln),
-                "matched": lines[ln][:80], "source": source_context(code, ln, base["hash"])}
-    return {**base, "why": "no_match" if not lines else f"ambiguous_{len(lines)}"}
+                "matched": found[ln][:80], "source": source_context(code, ln, base["hash"])}
+    tl = traceless_outcome(texts) or verdict_outcome(result)
+    if tl:  # a policy / validation / database-statement outcome: no traceback exists, and the reason is stated
+        return {**base, "status": "no_traceback", **tl}
+    why = unresolved_reason(texts)
+    if why:
+        return {**base, "why": why}
+    if stmts:
+        return {**base, "why": f"ambiguous_{len(stmts)}", "candidates": sorted(min(f) for f in stmts.values())[:8]}
+    return {**base, "why": "no_match"}
 
 
 def source_context(code: str | None, line: int | None, expected_hash: str | None, radius: int = 5) -> dict:
