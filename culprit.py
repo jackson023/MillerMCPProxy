@@ -26,6 +26,11 @@ from typing import Any, Callable, Iterable
 MAX_FRAMES = 12
 _TOOL_FILE_RE = re.compile(r"^tools/(?P<name>[A-Za-z0-9_\-.]+)\.py@v(?P<version>\d+)#(?P<hash>[0-9a-f]{12})$")
 _LEGACY_TOOL_RE = re.compile(r"^<(?:runner:)?tool:(?P<name>[^>]+)>$")
+# Code compiled from a string by OUR code under an ad-hoc name: <get_token>, <brick:foo@v3>, <crj:foo>. Optional #HASH12 makes the
+# source verifiable (dynamic_filename). A name with a space (<string>, <attrs generated ...>, <frozen ...>) is never ours.
+_DYN_RE = re.compile(r"^<(?P<name>[A-Za-z_][A-Za-z0-9_:.@\-]{0,100}?)(?:#(?P<hash>[0-9a-f]{12}))?>$")
+_DYN_NOT_APP = frozenset({"string", "stdin", "unknown", "module", "lambda", "eval", "exec", "genexpr", "listcomp", "template", "console", "input", "generated"})
+_DYN_MAX = 512
 _LIB_MARKERS = ("site-packages", "dist-packages", "/lib/python", "\\lib\\python", "<frozen", "node_modules")
 
 
@@ -59,6 +64,22 @@ def tool_name_from_filename(filename: str | None) -> str | None:
     return tool_ident_from_filename(filename)[0]
 
 
+def _dyn_match(filename: str | None):
+    m = _DYN_RE.match(filename or "")
+    return m if m and m["name"].lower() not in _DYN_NOT_APP else None
+
+
+def dynamic_filename(name: str, code: str | None) -> str:
+    """Compile filename for code that is compiled from a string under an ad-hoc name. The hash makes its lines verifiable."""
+    return f"<{name}#{code_hash12(code)}>"
+
+
+def dynamic_label_name(filename: str | None) -> str | None:
+    """The name of an ad-hoc <name> frame for DB connection labels (no ':' or '@': both are separators there), else None."""
+    m = _dyn_match(filename)
+    return re.sub(r"[:@]", "_", m["name"]) if m else None
+
+
 def build_identity(repo: str, env: dict | None = None) -> dict:
     """Repo identity baked at build time. commit is None when the build did not bake it (never guessed)."""
     e = env if env is not None else os.environ
@@ -78,6 +99,10 @@ def _classify(filename: str, repo_roots: Iterable[str], identity: dict) -> dict:
     if m:  # compiled by an old build: in our code, but identity is unknown, so it can never get source
         return {"file": f"tools/{m['name']}.py", "version": None, "hash": None,
                 "commit": None, "repo": None, "in_app": True, "kind": "tool_unversioned"}
+    m = _dyn_match(filename)
+    if m:  # our code, compiled from a string: the frame that raised is THIS one, never the caller that exec'd it
+        return {"file": f"<{m['name']}>", "version": None, "hash": m["hash"],
+                "commit": None, "repo": None, "in_app": True, "kind": "dynamic"}
     fn = filename or ""
     if not any(mark in fn for mark in _LIB_MARKERS) and not fn.startswith("<"):
         for root in repo_roots:
@@ -150,6 +175,18 @@ def remember_source(name: str, code: str | None) -> None:
         _SOURCES[name] = code
 
 
+_DYN_SOURCES: dict[str, str] = {}  # dynamic_filename -> the source compiled under it (bounded; filename carries the hash)
+
+
+def register_dynamic(filename: str, code: str | None) -> str:
+    """Remember the source compiled under a dynamic_filename so a failure inside it can show its lines. Returns filename."""
+    if filename and code and _dyn_match(filename) and "#" in filename:
+        if len(_DYN_SOURCES) >= _DYN_MAX and filename not in _DYN_SOURCES:
+            _DYN_SOURCES.pop(next(iter(_DYN_SOURCES)), None)
+        _DYN_SOURCES[filename] = code
+    return filename
+
+
 def culprit_from_exc(exc: BaseException | None, repo_roots: Iterable[str], identity: dict,
                      tool_code: str | None = None) -> dict:
     """The record stored with an error row. status: resolved | library_only | no_traceback.
@@ -180,6 +217,10 @@ def culprit_from_exc(exc: BaseException | None, repo_roots: Iterable[str], ident
                 out["source"] = source_context(code, c["line"], c.get("hash"))
         elif c["kind"] == "repo":
             out["source"] = repo_source_context(c.get("_abs"), c["line"], c.get("commit"))
+        elif c["kind"] == "dynamic":
+            code = _DYN_SOURCES.get(c.get("_abs") or "")
+            out["source"] = (source_context(code, c["line"], c.get("hash")) if code is not None else
+                             {"status": "unavailable", "why": "dynamic_source_not_registered"})
     except Exception:
         out["source"] = {"status": "unavailable", "why": "source_capture_failed"}
     _strip_internal(frames)
