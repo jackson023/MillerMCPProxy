@@ -308,6 +308,12 @@ def result_fingerprint(result: Any) -> str | None:
     texts = _result_texts(result)
     if not isinstance(result, dict) or not texts or not all(_BARE_STATUS_RE.match(t.strip()) for t in texts):
         return None
+    # [bug] #64760 gap 1: a certification verdict has a bare 'status=error' text too. The execution and the failed assertions
+    # are its identity, so a caller that returns the verdict unchanged carries the same fingerprint and can name its line.
+    if verdict_outcome(result) and result.get("execution_genie_id"):
+        return "vfp:" + hashlib.sha256(
+            f"{result.get('execution_genie_id')}|{result.get('verdict')}|{'; '.join(_failed_assertions(result))}".encode("utf-8", "replace")
+        ).hexdigest()[:32]
     html, sc = result.get("html"), result.get("status_code")
     if not isinstance(html, str) or len(html) < 40 or sc is None:
         return None
@@ -330,11 +336,30 @@ def traceless_outcome(texts: list[str]) -> dict | None:
     return None
 
 
+def _failed_assertions(result: Any) -> list[str]:
+    """['name op expected=E actual=A', ...] for the assertions of a verdict result that did not pass (at most 3)."""
+    out: list[str] = []
+    try:
+        for a in (result.get("assertions") or []) if isinstance(result, dict) else []:
+            if isinstance(a, dict) and a.get("status") not in ("ok", "pass", "passed"):
+                out.append(f"{a.get('name')} {a.get('op')} expected={a.get('expected')} actual={a.get('actual')}"[:160])
+            if len(out) >= 3:
+                break
+    except Exception:
+        pass
+    return out
+
+
 def verdict_outcome(result: Any) -> dict | None:
     """The RESULT itself is a certification verdict (certified is False, verdict failed|uncertain): data failed
-    its assertions, no code failed. Structural, so it holds even when the error text is a bare status."""
+    its assertions, no code failed. Structural, so it holds even when the error text is a bare status.
+    'rule' names the assertion(s) that failed: for a verdict that assertion IS the location of the failure."""
     if isinstance(result, dict) and result.get("certified") is False and result.get("verdict") in ("failed", "uncertain"):
-        return {"reason": "verdict_not_certified", "evidence": f"certified=False verdict={result.get('verdict')}"}
+        out = {"reason": "verdict_not_certified", "evidence": f"certified=False verdict={result.get('verdict')}"}
+        fa = _failed_assertions(result)
+        if fa:
+            out["rule"] = "; ".join(fa)[:200]
+        return out
     return None
 
 
@@ -351,13 +376,207 @@ def unresolved_reason(texts: list[str]) -> str | None:
     return None
 
 
-def resolve_status_error(code: str | None, result: Any, name: str, version: Any) -> dict:
+# [bug] #64760 gap 1: a tool that BUILDS a status=error result says which line built it. The static matcher below can only
+# find a line when the error text is a literal in the source; text built at runtime (an f-string over a database message, a
+# relayed callee error, a verdict) left status=no_traceback with no line. The tool knows the line at the moment it builds the
+# result, so it stamps it: `return culprit.stamp({"status": "error", "error": msg})` or `return culprit.error(msg, ...)`.
+# The stamp rides in the result under _culprit; resolve_status_error validates it, the dispatcher strips it.
+DECLARED_KEY = "_culprit"
+_DECL_KEEP = ("status", "kind", "file", "function", "line", "version", "hash", "commit", "repo", "source", "reason", "rule", "evidence")
+_DECL_MAX_JSON = 6000
+
+
+def _declare_frame(frame, reason, rule, lineno, exc, repo_roots, identity) -> dict:
+    """The culprit record for an error the given frame declares. A live exception gives its own traceback. A declared
+    reason (a policy / validation outcome) is no_traceback + reason + rule, located at the declaring line. Anything else
+    is resolved at the declaring line, the way resolve_status_error does for a literal. Never raises."""
+    import types
+
+    ident = identity or {"repo": None, "commit": None}
+    try:
+        if exc is not None and getattr(exc, "__traceback__", None) is not None:
+            c = {k: v for k, v in culprit_from_exc(exc, repo_roots, ident).items() if k != "error_class"}
+            if c.get("status") == "resolved":
+                return c
+            return {"status": "unresolved", "why": "exception_traceback_has_no_app_frame",
+                    "declared_line": frame.f_lineno, "frames": c.get("frames") or []}
+        tb = types.TracebackType(None, frame, frame.f_lasti, lineno or frame.f_lineno)
+        c = {k: v for k, v in culprit_from_exc(RuntimeError(rule or "declared").with_traceback(tb), repo_roots, ident).items()
+             if k != "error_class"}
+        if reason:
+            c.update(status="no_traceback", reason=reason, rule=rule)
+        return c
+    except Exception as ce:
+        return {"status": "unresolved", "why": f"culprit_helper_failed: {type(ce).__name__}", "frames": []}
+
+
+def declare(reason: str | None = None, rule: str | None = None, lineno: int | None = None,
+            exc: BaseException | None = None, back: int = 1, repo_roots: Iterable[str] = (),
+            identity: dict | None = None) -> dict:
+    """The culprit record for the line that CALLS this (back=1) or a frame further out. For a tool that writes its own
+    error-bus row: context={"culprit": culprit.declare(reason, rule)}."""
+    try:
+        frame = sys._getframe(back)
+    except Exception:
+        return {"status": "unresolved", "why": "no_caller_frame", "frames": []}
+    return _declare_frame(frame, reason, rule, lineno, exc, repo_roots, identity)
+
+
+def stamp(result: Any, reason: str | None = None, rule: str | None = None, lineno: int | None = None) -> Any:
+    """`return culprit.stamp({"status": "error", ...})`: records the calling line in the result and returns the SAME object.
+    Only a status=error|partial dict is touched; anything else passes through, so wrapping is always safe. Never raises.
+    reason/rule are for an outcome that is not a code failure (policy_block, input_validation ...); the dispatcher also
+    classifies by the error text, so they are optional."""
+    try:
+        if isinstance(result, dict) and result.get("status") in ("error", "partial") and DECLARED_KEY not in result:
+            result[DECLARED_KEY] = _declare_frame(sys._getframe(1), reason, rule, lineno, None, (), None)
+    except Exception:
+        pass
+    return result
+
+
+def here(reason: str | None = None, rule: str | None = None) -> dict | None:
+    """The dict-literal form of stamp: {"status": "error", "_culprit": culprit.here(), ...}. This is what compile_tool puts
+    into every `return {"status": "error", ...}` of a tool: the CALLING frame's own line, captured as the dict is built."""
+    try:
+        return _declare_frame(sys._getframe(1), reason, rule, None, None, (), None)
+    except Exception:
+        return None
+
+
+_STATUS_ERROR_RE = re.compile(r"""['"]status['"]\s*:\s*['"]error['"]""")
+
+
+class _StampErrorReturns(ast.NodeTransformer):
+    """Adds `"_culprit": __import__("culprit").here()` as the FIRST entry of every `return {"status": "error", ...}` dict
+    literal. Nothing else changes: same statements, same line numbers (the new nodes take the dict's own line), so the
+    code hash, every traceback and every source-context line still refer to the source the author wrote."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    @staticmethod
+    def _is_error_dict(d: ast.Dict) -> bool:
+        has_err = False
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value == "_culprit":
+                return False  # the author (or a previous pass) already placed one
+            if isinstance(k, ast.Constant) and k.value == "status" and isinstance(v, ast.Constant) and v.value == "error":
+                has_err = True
+        return has_err
+
+    def visit_Return(self, node: ast.Return):
+        self.generic_visit(node)
+        d = node.value
+        if isinstance(d, ast.Dict) and self._is_error_dict(d):
+            imp = ast.Call(func=ast.Name(id="__import__", ctx=ast.Load()), args=[ast.Constant(value="culprit")], keywords=[])
+            call = ast.Call(func=ast.Attribute(value=imp, attr="here", ctx=ast.Load()), args=[], keywords=[])
+            key = ast.Constant(value=DECLARED_KEY)
+            # A one-line span on the dict's FIRST line. Copying the dict's whole span would put the call's line at the dict's
+            # LAST line (CPython gives a method call the line where its attribute ends), and the stamp would point at the `}`.
+            for n in (imp, imp.func, imp.args[0], call, call.func, key):
+                n.lineno = n.end_lineno = d.lineno
+                n.col_offset = d.col_offset
+                n.end_col_offset = d.col_offset + 1
+            d.keys.insert(0, key)
+            d.values.insert(0, call)
+            self.count += 1
+        return node
+
+
+def compile_tool(src: str | None, filename: str):
+    """compile(src, filename, "exec") with the line that builds each status=error result recorded in the result
+    ([bug] #64760 gap 1). Used at every site that compiles TOOL source. A source without a status=error return literal is
+    compiled untouched; any failure of the transform falls back to the plain compile, so this can only add information.
+    A SyntaxError is the plain compile's own. dont_inherit: this module has `from __future__ import annotations`, and compile()
+    would hand that flag to every tool (string annotations), which the callers' own plain compile() never did."""
+    src = src or ""
+    if not _STATUS_ERROR_RE.search(src):
+        return compile(src, filename, "exec", dont_inherit=True)
+    try:
+        tree = ast.parse(src, filename)
+        t = _StampErrorReturns()
+        tree = t.visit(tree)
+        if not t.count:
+            return compile(src, filename, "exec", dont_inherit=True)
+        ast.fix_missing_locations(tree)
+        return compile(tree, filename, "exec", dont_inherit=True)
+    except SyntaxError:
+        raise
+    except Exception:
+        return compile(src, filename, "exec", dont_inherit=True)
+
+
+def error(message: Any, reason: str | None = None, rule: str | None = None, **fields: Any) -> dict:
+    """`return culprit.error("msg", field=...)` == `return culprit.stamp({"status": "error", "error": "msg", **fields})`,
+    stamped at the caller's line."""
+    res = {"status": "error", "error": message, **fields}
+    try:
+        res[DECLARED_KEY] = _declare_frame(sys._getframe(1), reason, rule, None, None, (), None)
+    except Exception:
+        pass
+    return res
+
+
+def located(cul: Any) -> bool:
+    """A culprit that names the file and line that built the error, whatever its class: a policy block or a validation failure
+    is no_traceback (no code is wrong) but the line that decided it is still the location. Used for the error-bus columns."""
+    return (isinstance(cul, dict) and bool(cul.get("declared")) and isinstance(cul.get("file"), str)
+            and isinstance(cul.get("line"), int) and not isinstance(cul.get("line"), bool) and cul["line"] > 0)
+
+
+def take_declared(result: Any) -> dict | None:
+    """Remove and return the stamp. The dispatcher calls this so the key never reaches a client or a stored result."""
+    if isinstance(result, dict):
+        d = result.pop(DECLARED_KEY, None)
+        return d if isinstance(d, dict) else None
+    return None
+
+
+def accept_declared(d: Any, result: Any, name: str, code: str | None) -> dict | None:
+    """The declared culprit for a status=error result when it is trustworthy, else None (the static matcher then runs).
+    Trust: it names an in-app frame (tool / repo / dynamic) with a line, and when it names THIS tool the code hash it carries
+    is the hash of the code that ran. Honest classification stays: a policy / validation / database / verdict outcome is
+    no_traceback with its reason, now WITH the line that decided it."""
+    try:
+        if not isinstance(d, dict) or d.get("status") not in ("resolved", "no_traceback"):
+            return None
+        f, ln = d.get("file"), d.get("line")
+        if not isinstance(f, str) or not f or isinstance(ln, bool) or not isinstance(ln, int) or ln < 1:
+            return None
+        if d.get("kind") not in ("tool", "repo", "dynamic"):
+            return None
+        if f == f"tools/{name}.py" and d.get("hash") and code and d["hash"] != code_hash12(code):
+            return None
+        rec = {k: d[k] for k in _DECL_KEEP if k in d}
+        for k in ("reason", "rule", "evidence"):
+            if isinstance(rec.get(k), str):
+                rec[k] = rec[k][:200]
+        if len(repr(rec)) > _DECL_MAX_JSON:
+            rec.pop("source", None)
+        if rec["status"] == "resolved":
+            tl = traceless_outcome(_result_texts(result)) or verdict_outcome(result)
+            if tl:
+                rec.update(status="no_traceback", **tl)
+        rec["declared"] = True
+        rec["frames"] = []
+        return rec
+    except Exception:
+        return None
+
+
+def resolve_status_error(code: str | None, result: Any, name: str, version: Any, declared: Any = None) -> dict:
     """Resolve a status=error RESULT (no exception) to the line in that version that produced it.
 
-    A candidate is a return/raise whose subtree holds a string literal (>= 6 chars, not a bare key)
+    A line the tool declared (culprit.stamp / culprit.error) wins when it validates. Otherwise a candidate is a return/raise
+    whose subtree holds a string literal (>= 6 chars, not a bare key)
     that appears inside the result's error text. Exactly one distinct line resolves; none or several
     is 'no_traceback' (with a stated reason) when the text is a policy / validation / database-statement / precondition
     outcome, else 'unresolved' (with a stated 'why'). Never a guess."""
+    acc = accept_declared(declared if declared is not None else (result.get(DECLARED_KEY) if isinstance(result, dict) else None),
+                          result, name, code)
+    if acc is not None:
+        return acc
     base = {"status": "unresolved", "kind": "tool_result", "file": f"tools/{name}.py", "version": version,
             "hash": code_hash12(code) if code else None, "frames": []}
     texts = _result_texts(result)
