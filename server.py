@@ -1033,16 +1033,72 @@ def _canary_trace_to_line(mode: str) -> None:
     raise RuntimeError("gateway trace-to-line canary: " + mode)  # CANARY_GATEWAY_RAISE_LINE
 
 
+async def _canary_bad_writer(*_a) -> None:
+    """The counts writer of the wt_flush canary: fails on purpose, at one known line, like an unreachable db-v3."""
+    raise ConnectionError("gateway work_ticket flush canary: ingest unreachable")  # CANARY_GATEWAY_WT_FLUSH_LINE
+
+
+def _canary_upstream() -> None:
+    """Stands in for a db-v3 failure so the /execute 502 path can be fired live. _proxy calls it for the one tool name
+    gateway_canary_upstream, before the circuit breaker is touched (a canary must not count against db-v3's health)."""
+    raise RuntimeError("gateway upstream canary: simulated db-v3 failure")  # CANARY_GATEWAY_UPSTREAM_LINE
+
+
+async def _canary_wt_flush() -> dict:
+    """Fire the work_ticket flush-failure path live: one counts row is seeded, flush_with hands it to a writer that
+    raises, flush_with logs the failure from inside its except block (the _TlLogHandler records it) and puts the counts
+    back. The seeded row is removed afterwards, so nothing is written to the grants table and no real count is lost."""
+    _k = ("gateway_canary", "gateway_canary_trace")
+    with _work_ticket._lock:
+        _work_ticket._counts.setdefault(_k, [0, 0])[0] += 1
+    try:
+        _n = await _work_ticket.flush_with(_canary_bad_writer)
+    finally:
+        with _work_ticket._lock:
+            _work_ticket._counts.pop(_k, None)
+    return {"status": "ok", "mode": "wt_flush", "flushed": _n, "trace_id": _wt_trace_id(),
+            "commit": _TL_IDENTITY.get("commit"),
+            "expect": {"file": "server.py", "function": "_canary_bad_writer", "line_marker": "CANARY_GATEWAY_WT_FLUSH_LINE"}}
+
+
+async def _canary_self_call(mode: str) -> dict:
+    """Fire the door path (door) or the /execute 502 path (upstream502) through the REAL app, in process: the request goes
+    through _WorkTicketDoor and the real route with the gateway's own key, and inherits this call's trace id.
+      door        -> POST /execute with a JSON array body: rest_execute raises on body.get, no route catches it, the door
+                     records it (where=door:/execute) and the client sees a 500.
+      upstream502 -> POST /execute for tool gateway_canary_upstream: _proxy raises, rest_execute answers 502 and records it."""
+    _t = _gw_ticket.get() or {}
+    _tid = _t.get("trace_id") or _wt_trace_id()
+    _hdrs = {"X-API-Key": API_KEY, "Content-Type": "application/json",
+             "traceparent": "00-%s-%s-01" % (_tid, os.urandom(8).hex())}
+    if _HEX16_RE.match(str(_t.get("span_id") or "")):
+        _hdrs["x-miller-span"] = _t["span_id"]
+    _body = "[]" if mode == "door" else json.dumps({"tool_name": "gateway_canary_upstream", "arguments": {}})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+                                 base_url="http://gateway.canary", timeout=httpx.Timeout(10.0)) as _c:
+        _r = await _c.post("/execute", content=_body, headers=_hdrs)
+    _exp = ({"file": "server.py", "function": "rest_execute", "line_marker": "tool_name = body.get(", "where": "door:/execute"}
+            if mode == "door" else
+            {"file": "server.py", "function": "_canary_upstream", "line_marker": "CANARY_GATEWAY_UPSTREAM_LINE", "where": "rest_execute"})
+    return {"status": "ok", "mode": mode, "http_status": _r.status_code, "trace_id": _tid,
+            "commit": _TL_IDENTITY.get("commit"), "expect": _exp}
+
+
 async def _handle_canary_trace(args: dict) -> dict:
     """[bug] #64738 standing canary for the gateway runtime. meta_tool(tool_name='gateway_canary_trace',
-    arguments={'mode': 'raise' | 'swallow'}).
+    arguments={'mode': 'raise' | 'swallow' | 'wt_flush' | 'door' | 'upstream502'}); the last three fire the work_ticket flush
+    failure, the door (uncaught exception) path and the /execute 502 path live, see _canary_wt_flush / _canary_self_call.
       raise   -> the failure escapes this handler, as a real handler failure would: _handle_tools_call catches it.
       swallow -> the failure is logged and the call carries on, as the gateway's best-effort paths do.
     Either way ONE platform_trace_timeline(id=<trace_id>) must show meta.culprit = server.py, _canary_trace_to_line,
     the CANARY_GATEWAY_RAISE_LINE line, this build's commit, and ~5 source lines around it."""
     mode = str((args or {}).get("mode") or "raise")
-    if mode not in ("raise", "swallow"):
-        return {"status": "error", "error": "mode must be raise or swallow", "got": mode[:40]}
+    if mode not in ("raise", "swallow", "wt_flush", "door", "upstream502"):
+        return {"status": "error", "error": "mode must be raise, swallow, wt_flush, door or upstream502", "got": mode[:40]}
+    if mode == "wt_flush":
+        return await _canary_wt_flush()
+    if mode in ("door", "upstream502"):
+        return await _canary_self_call(mode)
     if mode == "raise":
         _canary_trace_to_line(mode)
     try:
@@ -1081,6 +1137,9 @@ async def _proxy(tool_name: str, arguments: dict, trace_id: str) -> Any:
             f"Retry in {cb['seconds_until_retry']}s. "
             f"Consecutive failures: {cb['failures']}/{cb['threshold']}."
         )
+
+    if tool_name == "gateway_canary_upstream":   # [bug] #64738: the live canary for the /execute 502 path
+        _canary_upstream()
 
     payload = {"tool_name": tool_name, "arguments": arguments or {}}
     headers = {
