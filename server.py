@@ -135,6 +135,76 @@ def _wt_ticket_from_headers(headers, path: str) -> dict:
     return _wt_new()
 
 
+# == § 003c  TRACE TO LINE OF CODE ([bug] #64738) ================================
+# A gateway failure must be one platform_trace_timeline(id=<trace_id>) call from the exact file, function and line
+# that raised it. culprit.py is the canonical module (the same file in every Python runtime); it reads the LIVE
+# traceback, so nothing is parsed from text. The repo identity is (MillerMCPProxy, GIT_COMMIT_SHA): the commit is baked
+# into the revision by cloudbuild.yaml (service.yaml env, COMMIT_SHA_PLACEHOLDER) and is None, never guessed, when it
+# is not. The lines come from /app/server.py in the image, which IS the commit that was built.
+# The gateway has no database, so a record rides the span flush to db-v3 (gateway_span_ingest 'errors'), which writes
+# the platform_error_bus row (source_file/line/function + context.culprit) under the request's trace_id.
+# Three ways in: (1) _TlLogHandler: every WARNING/ERROR the gateway logs from inside an except block (the swallowed
+# failures); (2) the door (_WorkTicketDoor): an exception no route caught; (3) _tl_error() called directly.
+import culprit as _culprit  # noqa: E402
+
+_TL_IDENTITY = _culprit.build_identity("MillerMCPProxy")
+_TL_ROOTS = [os.path.dirname(os.path.abspath(__file__))]
+_TL_ERRORS: list = []
+_TL_ERRORS_MAX = 200
+_TL_FLUSH_MAX = 50
+_TL_SEEN: dict = {}
+_TL_DEDUPE_S = 60.0
+
+
+def _tl_error(exc, where: str) -> None:
+    """Queue the culprit record for one failure. Never raises: capture must not break the path it describes.
+    The same failure site seen again inside one trace (or, with no request, inside 60s) is recorded once."""
+    try:
+        if exc is None:
+            return
+        _t = _gw_ticket.get() or {}
+        _tid = _t.get("trace_id") if _HEX32_RE.match(str(_t.get("trace_id") or "")) else None
+        # who asked: the platform's caller label for a request (mcp / direct_api_key), None for the gateway's own
+        # background work. platform_error_bus_monitor counts only the None (production) rows toward its alerts.
+        _caller = _wt_caller(_t["path"], None) if _tid and _t.get("path") and _t.get("entry") != "boot" else None
+        _cul = _culprit.culprit_from_exc(exc, _TL_ROOTS, _TL_IDENTITY)
+        _key = (_tid, _cul.get("file"), _cul.get("line"), _cul.get("error_class"))
+        _now = time.monotonic()
+        _last = _TL_SEEN.get(_key)
+        if _last is not None and _now - _last < _TL_DEDUPE_S:
+            return
+        if len(_TL_SEEN) > 500:
+            _TL_SEEN.clear()
+        _TL_SEEN[_key] = _now
+        if len(_TL_ERRORS) >= _TL_ERRORS_MAX:
+            del _TL_ERRORS[0]
+        _TL_ERRORS.append({
+            "trace_id": _tid or os.urandom(16).hex(), "span_id": _t.get("span_id"), "tool": _t.get("tool"),
+            "caller": _caller, "where": str(where)[:120], "error_name": type(exc).__name__[:80], "error_msg": str(exc)[:500],
+            "culprit": _cul})
+    except Exception:
+        pass
+
+
+class _TlLogHandler(logging.Handler):
+    """A WARNING or ERROR logged from inside an except block is a failure the gateway swallowed: take its culprit
+    from the exception being handled (logging runs this synchronously, in the same context as the log call)."""
+
+    def emit(self, record) -> None:
+        try:
+            _ei = record.exc_info
+            _exc = _ei[1] if isinstance(_ei, tuple) and len(_ei) > 1 and _ei[1] is not None else _culprit.current_exc()
+            if _exc is not None:
+                _tl_error(_exc, "log:%s:%s" % (record.name, record.funcName))
+        except Exception:
+            pass
+
+
+_tl_handler = _TlLogHandler(level=logging.WARNING)
+for _tl_logger_name in ("miller-mcp-gateway", "smart_pool", "work_ticket"):
+    logging.getLogger(_tl_logger_name).addHandler(_tl_handler)
+
+
 # -- Spans: the gateway leg of every trace (platform_trace_timeline) ----------------------------------------------
 # One span per request at the door and one per outbound call, so a trace reads Claude -> gateway -> db-v3 -> ... as
 # one tree. Each outbound hand-off is its own span: its id goes out as the traceparent parent-id AND as X-Miller-Span
@@ -202,6 +272,7 @@ class _WorkTicketDoor:
         _t0 = time.time()
         _m0 = time.monotonic()
         _status = [None]
+        _exc_name = [None]
         try:
             _hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or ()}
             _ticket = _wt_ticket_from_headers(_hdrs, scope.get("path") or "")
@@ -217,6 +288,13 @@ class _WorkTicketDoor:
 
         try:
             return await self.app(scope, receive, _send)
+        except BaseException as _exc:
+            # [bug] #64738: an exception no route caught. The ticket is still set here, so the record is under
+            # this request's trace_id. Cancellation is not a failure.
+            _exc_name[0] = type(_exc).__name__
+            if isinstance(_exc, Exception):
+                _tl_error(_exc, "door:%s" % (scope.get("path") or "")[:100])
+            raise
         finally:
             if _tok is not None:
                 _gw_ticket.reset(_tok)
@@ -231,11 +309,12 @@ class _WorkTicketDoor:
                         "trace_id": _ticket["trace_id"], "span_id": _ticket["span_id"],
                         "parent_span_id": _ticket.get("parent_span_id"), "service": "gateway",
                         "operation": _op, "tool": _ticket.get("tool"),
-                        "status": "ok" if _code is not None and _code < 400 else "error",
+                        "status": "ok" if _code is not None and _code < 400 and not _exc_name[0] else "error",
                         "caller_source": _wt_caller(_path, _code),
                         "start": _wt_iso(_t0), "end": _wt_iso(_t0 + (time.monotonic() - _m0)),
                         "attrs": {"path": _path[:200], "http_status": _code if _code is not None else 0,
-                                  **({"rpc": _ticket["rpc"]} if _ticket.get("rpc") else {})},
+                                  **({"rpc": _ticket["rpc"]} if _ticket.get("rpc") else {}),
+                                  **({"error": _exc_name[0]} if _exc_name[0] else {})},
                     })
             except Exception:
                 pass
@@ -325,9 +404,13 @@ async def _wt_flush_loop() -> None:
     await _work_ticket.flush_loop_with(_wt_write)
 
 
-async def _wt_span_write(spans: list) -> None:
-    """Send one batch of spans to db-v3 (gateway_span_ingest). Raises on any failure so the caller keeps them."""
-    payload = {"tool_name": "gateway_span_ingest", "arguments": {"spans": spans}}
+async def _wt_span_write(spans: list, errors: list | None = None) -> None:
+    """Send one batch of spans, and the failures with their culprit ([bug] #64738), to db-v3 (gateway_span_ingest).
+    Raises on any failure so the caller keeps them."""
+    _args = {"spans": spans}
+    if errors:
+        _args["errors"] = errors
+    payload = {"tool_name": "gateway_span_ingest", "arguments": _args}
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
         r = await client.post(DB_V3_EXECUTE, json=payload, headers={"X-API-Key": API_KEY,
                                                                     "Content-Type": "application/json"})
@@ -340,19 +423,25 @@ async def _wt_span_write(spans: list) -> None:
         raise RuntimeError(f"gateway_span_ingest refused: {str(_body)[:200]}")
     if isinstance(_inner, dict) and _inner.get("rejected"):
         logger.warning("gateway_span_ingest rejected %s span(s): %s", _inner.get("rejected"), _inner.get("rejects"))
+    if isinstance(_inner, dict) and _inner.get("errors_rejected"):
+        logger.warning("gateway_span_ingest rejected %s error record(s): %s", _inner.get("errors_rejected"),
+                       _inner.get("error_rejects"))
 
 
 async def _wt_span_flush() -> int:
     """Send everything buffered, one batch at a time. A failed batch goes back to the front of the buffer (still
-    bounded by _WT_SPANS_MAX), so a db-v3 blip loses nothing that fits."""
+    bounded by _WT_SPANS_MAX / _TL_ERRORS_MAX), so a db-v3 blip loses nothing that fits."""
     sent = 0
-    while _WT_SPANS:
+    while _WT_SPANS or _TL_ERRORS:
         batch = _WT_SPANS[:_WT_SPAN_BATCH]
         del _WT_SPANS[:len(batch)]
+        errs = _TL_ERRORS[:_TL_FLUSH_MAX]
+        del _TL_ERRORS[:len(errs)]
         try:
-            await _wt_span_write(batch)
+            await _wt_span_write(batch, errs)
         except Exception as exc:
             _WT_SPANS[:0] = batch[: max(0, _WT_SPANS_MAX - len(_WT_SPANS))]
+            _TL_ERRORS[:0] = errs[: max(0, _TL_ERRORS_MAX - len(_TL_ERRORS))]
             logger.warning("gateway span flush failed (%d kept for next flush): %r", len(batch), exc)
             break
         sent += len(batch)
@@ -939,11 +1028,37 @@ async def _handle_code_edit(arguments: dict) -> Any:
     return await _proxy("code_edit", args, _trace)
 
 
+def _canary_trace_to_line(mode: str) -> None:
+    """Fails on purpose, at one known line. The canary asserts that the trace names THIS function and THIS line."""
+    raise RuntimeError("gateway trace-to-line canary: " + mode)  # CANARY_GATEWAY_RAISE_LINE
+
+
+async def _handle_canary_trace(args: dict) -> dict:
+    """[bug] #64738 standing canary for the gateway runtime. meta_tool(tool_name='gateway_canary_trace',
+    arguments={'mode': 'raise' | 'swallow'}).
+      raise   -> the failure escapes this handler, as a real handler failure would: _handle_tools_call catches it.
+      swallow -> the failure is logged and the call carries on, as the gateway's best-effort paths do.
+    Either way ONE platform_trace_timeline(id=<trace_id>) must show meta.culprit = server.py, _canary_trace_to_line,
+    the CANARY_GATEWAY_RAISE_LINE line, this build's commit, and ~5 source lines around it."""
+    mode = str((args or {}).get("mode") or "raise")
+    if mode not in ("raise", "swallow"):
+        return {"status": "error", "error": "mode must be raise or swallow", "got": mode[:40]}
+    if mode == "raise":
+        _canary_trace_to_line(mode)
+    try:
+        _canary_trace_to_line(mode)
+    except Exception as exc:
+        logger.warning("gateway canary swallowed failure: %r", exc)
+    return {"status": "ok", "mode": mode, "trace_id": _wt_trace_id(), "commit": _TL_IDENTITY.get("commit"),
+            "expect": {"file": "server.py", "function": "_canary_trace_to_line", "line_marker": "CANARY_GATEWAY_RAISE_LINE"}}
+
+
 _LOCAL_HANDLERS: dict[str, Any] = {
     "ping":            _handle_ping,
     "gateway_status":  _handle_gateway_status,
     "restart_service": _handle_restart_service,
     "code_edit":       _handle_code_edit,
+    "gateway_canary_trace": _handle_canary_trace,
 }
 
 # == § 008  PROXY (_proxy) =====================================================
@@ -1665,6 +1780,7 @@ async def rest_execute(request: Request) -> Response:
         result = await _proxy(tool_name, arguments, trace_id)
         return JSONResponse(content=result)
     except Exception as exc:
+        _tl_error(exc, "rest_execute")   # [bug] #64738: this handler answers 502 and logs nothing, so record it here
         return JSONResponse(status_code=502, content={
             "error":    str(exc),
             "tool":     tool_name,

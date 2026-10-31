@@ -125,7 +125,7 @@ steps:
     echo "0" > /workspace/deploy_exit.txt
 
     echo "Step 1: Injecting image tag into service.yaml..."
-    sed "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g; s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g" service.yaml > /tmp/service-deploy.yaml
+    sed "s|IMAGE_PLACEHOLDER|$_IMAGE:$COMMIT_SHA|g; s|ALLOYDB_INSTANCE_PLACEHOLDER|$_ALLOYDB_INSTANCE_URI|g; s|COMMIT_SHA_PLACEHOLDER|$COMMIT_SHA|g" service.yaml > /tmp/service-deploy.yaml
 
     echo "Step 2: Verifying sidecar in spec..."
     grep -q "alloydb-proxy" /tmp/service-deploy.yaml || { echo "ERROR: alloydb-proxy missing"; echo "1" > /workspace/deploy_exit.txt; exit 1; }

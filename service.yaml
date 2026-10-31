@@ -6,7 +6,7 @@
 # IMAGE_PLACEHOLDER is replaced at build time by cloudbuild.yaml deploy step.
 #
 # Manual deploy:
-#   sed 's|IMAGE_PLACEHOLDER|<your-image-tag>|' service.yaml > /tmp/svc.yaml
+#   sed 's|IMAGE_PLACEHOLDER|<your-image-tag>|; s|COMMIT_SHA_PLACEHOLDER|<commit-sha>|' service.yaml > /tmp/svc.yaml
 #   gcloud run services replace /tmp/svc.yaml --region=us-central1 --project=miller-iq-platform
 
 apiVersion: serving.knative.dev/v1
@@ -41,6 +41,11 @@ spec:
             cpu: 500m
             memory: 256Mi
         env:
+        # [bug] #64738 trace-to-line: the commit this revision was built from. cloudbuild.yaml replaces the
+        # placeholder; a manual deploy that does not leaves it as is, and culprit.build_identity then reports
+        # commit=None (it rejects anything that is not 7-40 hex chars) rather than a guess.
+        - name: GIT_COMMIT_SHA
+          value: COMMIT_SHA_PLACEHOLDER
         - name: TOOL_RELOAD_TS
           value: '20260505-1520'
         - name: DATABASE_URL
