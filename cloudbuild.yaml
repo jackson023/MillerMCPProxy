@@ -115,6 +115,20 @@ steps:
   waitFor:
   - record-push-complete
 
+# == UNIT TESTS ([bug] #64830) ================================================
+# Standard-library script suites in test/ (exit non-zero on failure). Runs from the build's start; deploy waits on it,
+# so a red suite blocks the deploy.
+- id: unit-tests
+  name: python:3.13-slim
+  entrypoint: bash
+  args:
+  - -c
+  - |
+    set -u; red=0
+    for f in test/test_*.py; do python3 -I "$f" || { echo "RED: $f"; red=1; }; done
+    [ "$red" -eq 0 ] && echo "GREEN: unit tests" || exit 1
+  waitFor: ['-']
+
 - id: deploy
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   allowFailure: true
@@ -161,6 +175,7 @@ steps:
     echo "=== Deploy complete ==="
   waitFor:
   - vuln-scan-gate
+  - unit-tests
 
 - id: record-deploy-result
   name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
