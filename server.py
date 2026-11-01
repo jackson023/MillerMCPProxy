@@ -148,6 +148,12 @@ def _wt_ticket_from_headers(headers, path: str) -> dict:
 import culprit as _culprit  # noqa: E402
 
 _TL_IDENTITY = _culprit.build_identity("MillerMCPProxy")
+# [bug] #64738 line level: which of the gateway's OWN lines ran for each request (the gateway runs no tool code). The door
+# span carries them as attributes.lines_ran, keyed by path under the app directory; with attributes.build (repo@commit12)
+# that names the exact source: platform_trace_timeline code_ran.builds[].lines_ran shows it with a link to the file at that commit.
+import line_trace as _line_trace  # noqa: E402
+_line_trace.add_repo_root(os.path.dirname(os.path.abspath(__file__)))
+_line_trace.enable()
 _TL_ROOTS = [os.path.dirname(os.path.abspath(__file__))]
 _TL_ERRORS: list = []
 _TL_ERRORS_MAX = 200
@@ -269,6 +275,7 @@ class _WorkTicketDoor:
             return await self.app(scope, receive, send)
         _tok = None
         _ticket = None
+        _lt_rec = _line_trace.begin()   # never raises; None = this request runs untraced
         _t0 = time.time()
         _m0 = time.monotonic()
         _status = [None]
@@ -298,6 +305,7 @@ class _WorkTicketDoor:
         finally:
             if _tok is not None:
                 _gw_ticket.reset(_tok)
+            _lt_sum = _line_trace.end(_lt_rec)
             try:
                 _path = scope.get("path") or ""
                 if _ticket and scope.get("type") == "http" and _path not in _WT_SPAN_SKIP_PATHS:
@@ -314,7 +322,8 @@ class _WorkTicketDoor:
                         "start": _wt_iso(_t0), "end": _wt_iso(_t0 + (time.monotonic() - _m0)),
                         "attrs": {"path": _path[:200], "http_status": _code if _code is not None else 0,
                                   **({"rpc": _ticket["rpc"]} if _ticket.get("rpc") else {}),
-                                  **({"error": _exc_name[0]} if _exc_name[0] else {})},
+                                  **({"error": _exc_name[0]} if _exc_name[0] else {}),
+                                  **_line_trace.span_attributes(_lt_sum)},
                     })
             except Exception:
                 pass
