@@ -404,10 +404,18 @@ async def _wt_flush_loop() -> None:
     await _work_ticket.flush_loop_with(_wt_write)
 
 
+# [decision] #51749 which code ran: the gateway's own build rides every span batch (gateway_span_ingest stamps it on each
+# span as attributes.build, the key db-v3 stamps on its spans), so platform_trace_timeline meta.code_ran lists the gateway
+# build beside db-v3's. repo@commit12 from the baked GIT_COMMIT_SHA; None, never guessed, when the image has none.
+_WT_BUILD12 = ("MillerMCPProxy@" + _TL_IDENTITY["commit"][:12]) if len(_TL_IDENTITY.get("commit") or "") >= 12 else None
+
+
 async def _wt_span_write(spans: list, errors: list | None = None) -> None:
     """Send one batch of spans, and the failures with their culprit ([bug] #64738), to db-v3 (gateway_span_ingest).
     Raises on any failure so the caller keeps them."""
     _args = {"spans": spans}
+    if _WT_BUILD12:
+        _args["build"] = _WT_BUILD12
     if errors:
         _args["errors"] = errors
     payload = {"tool_name": "gateway_span_ingest", "arguments": _args}
