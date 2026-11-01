@@ -152,6 +152,7 @@ _TL_IDENTITY = _culprit.build_identity("MillerMCPProxy")
 # span carries them as attributes.lines_ran, keyed by path under the app directory; with attributes.build (repo@commit12)
 # that names the exact source: platform_trace_timeline code_ran.builds[].lines_ran shows it with a link to the file at that commit.
 import line_trace as _line_trace  # noqa: E402
+import arg_parse as _arg_parse  # noqa: E402  [bug] #64830: the ONE inner-arguments parser (both meta_tool paths)
 _line_trace.add_repo_root(os.path.dirname(os.path.abspath(__file__)))
 _line_trace.enable()
 _TL_ROOTS = [os.path.dirname(os.path.abspath(__file__))]
@@ -1306,20 +1307,9 @@ async def _startup() -> None:
 # JSON-RPC helpers
 # ---------------------------------------------------------------------------
 def _sanitize_json_escapes(s: str) -> str:
-    """Strip invalid JSON escape sequences before json.loads/raw_decode.
-
-    JSON only allows: \\\", \\\\, \\/, \\b, \\f, \\n, \\r, \\t, \\uXXXX.
-    Python-style \\' (and any other \\X where X is not a valid JSON escape)
-    causes json.loads to throw. Strip the backslash — \\' becomes ', which
-    is the intent. This is safe: single quotes never need escaping in JSON.
-
-    S1171: enterprise fix — eliminates the 'meta_tool: inner arguments JSON
-    parse failed' failure mode that occurred when Claude constructed patch
-    strings with Python-style quoting.
-    """
-    import re as _re_sj
-    # Strip \ not followed by a valid JSON escape char
-    return _re_sj.sub(r'\\(?!["\\\'/bfnrtu0-9])', '', s)
+    """Strip invalid JSON escape sequences (S1171). Delegates to arg_parse, the one implementation ([bug] #64830:
+    the old lookahead regex listed ' as valid, so the Python-style \\' it was written for was never repaired)."""
+    return _arg_parse.sanitize_json_escapes(s)
 
 
 def _ok(req_id: Any, result: Any) -> dict:
@@ -1418,6 +1408,7 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
     trace_id  = _wt_trace_id()   # [decision] #51749: the door's ticket for this MCP request
+    _args_repairs = []           # [bug] #64830: argument repairs, logged and returned to the caller (never silent)
 
     # arguments may arrive as a JSON string from MCP serialization
     if isinstance(arguments, str):
@@ -1425,10 +1416,11 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
         if len(_args_raw) > _LARGE_PAYLOAD_THRESHOLD:
             return _large_payload_block(req_id, len(_args_raw), tool_name)
         try:
-            try:
-                arguments = json.loads(arguments.strip())
-            except Exception:
-                arguments = json.loads(_sanitize_json_escapes(arguments.strip()))
+            arguments, _note, _perr = _arg_parse.parse_inner_args(arguments)
+            if _perr:
+                raise ValueError(_perr)
+            if _note:
+                _args_repairs.append(dict(_note, level="outer"))
         except Exception as _exc:
             logger.error(
                 "meta_tool outer_args parse FAILED tool=%s len=%d err=%s preview=%.300r",
@@ -1479,10 +1471,11 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             if len(_raw) > _LARGE_PAYLOAD_THRESHOLD:
                 return _large_payload_block(req_id, len(_raw), inner or tool_name)
             try:
-                try:
-                    inner_args = json.loads(inner_args.strip())
-                except Exception:
-                    inner_args = json.loads(_sanitize_json_escapes(inner_args.strip()))
+                inner_args, _note, _perr = _arg_parse.parse_inner_args(inner_args)
+                if _perr:
+                    raise ValueError(_perr)
+                if _note:
+                    _args_repairs.append(dict(_note, level="inner", inner_tool=inner))
             except Exception as _exc:
                 logger.error(
                     "meta_tool inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r",
@@ -1494,7 +1487,8 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
                         "inner_tool": inner,
                         "inner_args_len": len(_raw),
                         "inner_args_preview": _raw[:300],
-                        "hint": "Use lines=N-M mode for old_str (derives from source, zero encoding) + b64: prefix for new_str. Never pass JSON strings with Python-style escapes.",
+                        "inner_args_tail": _raw[-80:],
+                        "hint": "Send arguments as a JSON object. A long payload goes through /platform/upload -> stage_payload_from_gcs -> staged_id.",
                     })}],
                     "isError": True,
                 })
@@ -1674,6 +1668,9 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             _ct_task.add_done_callback(_bg_tasks.discard)
 
         content_blocks = [{"type": "text", "text": text}]
+        if _args_repairs:
+            logger.warning("meta_tool arguments repaired tool=%s trace=%s repairs=%s", tool_name, trace_id, _args_repairs)
+            content_blocks.append({"type": "text", "text": json.dumps({"_meta_tool_arguments_repaired": _args_repairs})})
         if inline_image_b64:
             content_blocks.append({
                 "type":     "image",
@@ -1822,10 +1819,11 @@ def _unwrap_meta_tool_rest(tool_name: str, arguments: Any) -> tuple[str, dict, s
             if len(_raw) > _LARGE_PAYLOAD_THRESHOLD:
                 return tool_name, {}, f"BLOCKED: payload too large for meta_tool inline JSON argument transport ({len(_raw)} chars, threshold {_LARGE_PAYLOAD_THRESHOLD} chars)"
             try:
-                try:
-                    inner_args = json.loads(inner_args.strip())
-                except Exception:
-                    inner_args = json.loads(_sanitize_json_escapes(inner_args.strip()))
+                inner_args, _note, _perr = _arg_parse.parse_inner_args(inner_args)
+                if _perr:
+                    raise ValueError(_perr)
+                if _note:
+                    logger.warning("meta_tool(rest) inner_args repaired inner_tool=%s note=%s", inner, _note)
             except Exception as _exc:
                 logger.error("meta_tool(rest) inner_args parse FAILED inner_tool=%s len=%d err=%s preview=%.300r", inner, len(_raw), _exc, _raw)
                 return tool_name, {}, f"meta_tool: inner arguments JSON parse failed: {_exc}"
