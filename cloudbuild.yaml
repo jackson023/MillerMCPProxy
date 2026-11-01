@@ -289,6 +289,11 @@ steps:
         break
       fi
 
+      # A 4xx is an ANSWER (refused / bad request), not an outage: retrying cannot help and passing hides it
+      # ([bug] #64805: refused as 'internal' 2026-09-25..11-01 and every deploy passed as 'unreachable').
+      case "$HTTP_CODE" in
+        4??) echo "FATAL: post_deploy_health_check REFUSED (HTTP $HTTP_CODE): $(head -c 400 /tmp/phc_response.json 2>/dev/null)"; exit 1 ;;
+      esac
       echo "Attempt $ATTEMPT failed (HTTP $HTTP_CODE). Waiting 20s before retry..."
       sleep 20
     done
@@ -301,19 +306,19 @@ steps:
     fi
 
     HEALTH=$(echo "$RESULT" | python3 -c \
-      "import sys,json; d=json.load(sys.stdin); print(d.get('health_status','unknown'))" \
+      "import sys,json; d=json.load(sys.stdin); d=d.get('result',d) if isinstance(d.get('result'),dict) else d; print(d.get('health_status','unknown'))" \
       2>/dev/null || echo "parse_error")
 
     MARKED_STABLE=$(echo "$RESULT" | python3 -c \
-      "import sys,json; d=json.load(sys.stdin); print(d.get('marked_stable', False))" \
+      "import sys,json; d=json.load(sys.stdin); d=d.get('result',d) if isinstance(d.get('result'),dict) else d; print(d.get('marked_stable', False))" \
       2>/dev/null || echo "False")
 
     REVISION=$(echo "$RESULT" | python3 -c \
-      "import sys,json; d=json.load(sys.stdin); print(d.get('revision','unknown'))" \
+      "import sys,json; d=json.load(sys.stdin); d=d.get('result',d) if isinstance(d.get('result'),dict) else d; print(d.get('revision','unknown'))" \
       2>/dev/null || echo "unknown")
 
     RESPONSE_MS=$(echo "$RESULT" | python3 -c \
-      "import sys,json; d=json.load(sys.stdin); print(d.get('response_time_ms','?'))" \
+      "import sys,json; d=json.load(sys.stdin); d=d.get('result',d) if isinstance(d.get('result'),dict) else d; print(d.get('response_time_ms','?'))" \
       2>/dev/null || echo "?")
 
     echo ""
@@ -324,6 +329,11 @@ steps:
     echo "  Marked stable:    $MARKED_STABLE"
     echo "  Build ID:         $BUILD_ID"
     echo "  Commit SHA:       $COMMIT_SHA"
+
+    if [ "$HEALTH" = "unknown" ] || [ "$HEALTH" = "parse_error" ]; then
+      echo "FATAL: health check answered but did not run ([bug] #64805): $(echo "$RESULT" | head -c 400)"
+      exit 1
+    fi
 
     if [ "$HEALTH" = "unhealthy" ]; then
       echo ""
