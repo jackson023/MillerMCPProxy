@@ -1334,8 +1334,9 @@ def _err(req_id: Any, code: int, message: str) -> dict:
 # CORRUPT them instead (the sanitizer above strips backslashes it should not),
 # so a payload that happens to parse at this size still cannot be trusted.
 # Blocking above a safe threshold, before ever attempting json.loads, is the
-# only trustworthy behavior. platform_publish has a matching *_gcs_url sibling
-# for every content-heavy parameter -- that is the correct, reliable path.
+# only trustworthy behavior. The large-payload path is DB-as-bus ([decision] #30714, #32023):
+# /platform/upload (X-Session-Key) -> stage_payload_from_gcs -> staged_id -> platform_publish(staged_id,
+# staged_field). The *_gcs_url params this message used to name are retired -- nothing resolves them.
 _LARGE_PAYLOAD_THRESHOLD = 3000  # chars, raw string length before any parsing
 
 
@@ -1348,14 +1349,16 @@ def _large_payload_block(req_id: Any, raw_len: int, tool_name: str) -> dict:
             "tool": tool_name,
             "fix": (
                 "Do not retry with base64, manual re-escaping, or any other inline workaround -- "
-                "this transport is unreliable above the threshold regardless of encoding. Instead: "
+                "this transport is unreliable above the threshold regardless of encoding. Instead ([bug] #64793): "
                 "(1) write the content to a file with bash_tool; "
-                "(2) upload it via curl -X POST https://miller-mcp-db-v3-146372550543.us-central1.run.app/platform/upload "
-                "-H 'X-API-Key: <key>' -H 'X-Upload-Filename: <name>' -H 'X-Upload-Folder: <folder>' --data-binary @file; "
-                "(3) pass the matching *_gcs_url parameter to platform_publish instead of the inline field: "
-                "code_gcs_url (for code=), js_gcs_url (for js=), sql_gcs_url (for sql=), html_gcs_url (for html=), "
-                "patches_gcs_url (for patches=), yaml_gcs_url, jinja_gcs_url, shell_gcs_url. "
-                "platform_publish fetches the content server-side -- the large blob never touches this transport."
+                "(2) upload it: curl -X POST https://miller-mcp-db-v3-146372550543.us-central1.run.app/platform/upload "
+                "-H 'X-Session-Key: <your open_session key>' -H 'X-Upload-Filename: <name>' "
+                "-H 'X-Upload-Folder: uploads/staging' --data-binary @file (a 401 body names the reason); "
+                "(3) stage it: stage_payload_from_gcs(gcs_path='gs://miller-platform-assets/uploads/staging/<name>', "
+                "payload_type='code'|'patches'|'sql'|..., target=<tool>) -> staged_id "
+                "(patches need resolve_from_tool on every patch); "
+                "(4) publish: platform_publish(target=<tool>, staged_id=<id>, staged_field='code'|'patches'|..., reason=...). "
+                "The large blob never touches this transport. The old *_gcs_url params are retired -- do not use them."
             ),
         })}],
         "isError": True,
