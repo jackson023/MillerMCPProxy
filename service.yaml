@@ -84,6 +84,12 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-platform-api-key-secondary
+        # Decision 53264: the helper AI key. Accepted on /mcp and /execute only; forwarded to db-v3 as the helper.
+        - name: API_KEY_HELPER
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: miller-helper-api-key
         - name: MCP_AUTH_MODE
           value: warn
         - name: RUNNER_MASTER_SECRET

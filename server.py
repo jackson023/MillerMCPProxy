@@ -500,7 +500,7 @@ def _key_match(presented: str) -> str:
     p = presented.encode("utf-8", "ignore")
     matched = ""
     # No early exit: every candidate is compared, each in constant time.
-    for label, key in (("current", API_KEY), ("secondary", API_KEY_SECONDARY)):
+    for label, key in (("current", API_KEY), ("secondary", API_KEY_SECONDARY), ("helper", HELPER_KEY)):
         if len(key) >= _MIN_KEY_LEN and hmac.compare_digest(p, key.encode("utf-8")):
             matched = matched or label
     return matched
@@ -522,7 +522,7 @@ async def _emit_auth_event(event_type: str, data: dict) -> None:
     payload = {"event_type": event_type, "entity_type": "gateway_auth",
                "data": dict(data, gateway="miller-mcp-gateway")}
     try:
-        res = await _proxy("log_audit_event", payload, _wt_trace_id())
+        res = await _proxy("log_audit_event", payload, _wt_trace_id(), use_request_key=False)
     except Exception as exc:  # the bus write must never break or block the request
         logger.warning("auth_event_write_failed type=%s err=%s", event_type, exc)
         return
@@ -557,8 +557,11 @@ def _record_auth_event(request: Request, route: str, state: str, mode: str) -> N
 def _auth_gate(request: Request, route: str, *, allow_query: bool = False, mode: str = "enforce") -> bool:
     presented = _presented_key(request, allow_query)
     matched = _key_match(presented)
-    if matched != "current":
+    if matched == "helper" and route not in ("/mcp", "/execute"):
+        matched = ""  # a helper key opens /mcp and /execute only, never /admin/*
+    if matched not in ("current", "helper"):
         _record_auth_event(request, route, matched or ("invalid" if presented else "absent"), mode)
+    _REQ_KEY.set(HELPER_KEY if matched == "helper" else "")
     return bool(matched) or mode != "enforce"
 
 # == § 004  UUID DISCOVERY =====================================================
@@ -575,6 +578,10 @@ _UUID_PATTERN = _re.compile(
     _re.I,
 )
 _upstream_hdrs: _ContextVar[dict] = _ContextVar('_upstream_hdrs', default={})
+# Decision 53264: a helper AI presents its own key. The gateway recognises it on /mcp and /execute only and
+# forwards it to db-v3 as the helper (never as the owner), so db-v3's caller gate keeps it read + stage only.
+HELPER_KEY = os.environ.get("API_KEY_HELPER", "").strip()
+_REQ_KEY: _ContextVar[str] = _ContextVar('_req_key', default='')
 _FORWARD_PREFIXES = (
     'anthropic-', 'x-claude-', 'x-conversation-', 'x-chat-',
     'referer', 'origin', 'traceparent', 'baggage',
@@ -1143,7 +1150,7 @@ _LOCAL_HANDLERS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # Proxy — forward tool call to db-v3 /execute
 # ---------------------------------------------------------------------------
-async def _proxy(tool_name: str, arguments: dict, trace_id: str) -> Any:
+async def _proxy(tool_name: str, arguments: dict, trace_id: str, use_request_key: bool = True) -> Any:
     """
     Forward a tool call to miller-mcp-db-v3 /execute.
     Circuit breaker wraps every call. Structured audit log on every outcome.
@@ -1161,7 +1168,7 @@ async def _proxy(tool_name: str, arguments: dict, trace_id: str) -> Any:
 
     payload = {"tool_name": tool_name, "arguments": arguments or {}}
     headers = {
-        "X-API-Key":         API_KEY,
+        "X-API-Key":         (_REQ_KEY.get() or API_KEY) if use_request_key else API_KEY,
         "X-Trace-Id":        trace_id,
         "X-Gateway-Version": GW_VERSION,
         "Content-Type":      "application/json",
