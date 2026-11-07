@@ -21,7 +21,7 @@ substitutions:
 
 steps:
 - id: record-build-started
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   secretEnv: ['PLATFORM_API_KEY']
   script: |
     command -v python3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq python3 >/dev/null 2>&1; }
@@ -72,7 +72,7 @@ steps:
   - build
 
 - id: record-build-complete
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   secretEnv: ['PLATFORM_API_KEY']
   script: |
     command -v python3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq python3 >/dev/null 2>&1; }
@@ -84,7 +84,7 @@ steps:
   - build
 
 - id: record-push-complete
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   secretEnv: ['PLATFORM_API_KEY']
   script: |
     command -v python3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq python3 >/dev/null 2>&1; }
@@ -99,7 +99,7 @@ steps:
   - push
 
 - id: vuln-scan-gate
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   script: |
     set -e
     command -v python3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq python3 >/dev/null 2>&1; }
@@ -136,7 +136,7 @@ steps:
   waitFor: ['-']
 
 - id: deploy
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   allowFailure: true
   script: |
     set -uo pipefail
@@ -184,7 +184,7 @@ steps:
   - unit-tests
 
 - id: record-deploy-result
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   secretEnv: ['PLATFORM_API_KEY']
   script: |
     command -v python3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq python3 >/dev/null 2>&1; }
@@ -202,7 +202,7 @@ steps:
   - deploy
 
 - id: capture-boot-crash
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   allowFailure: false
   secretEnv: ['PLATFORM_API_KEY']
   script: |
@@ -258,7 +258,7 @@ steps:
   - deploy
 
 - id: platform-health-check
-  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:591.0.0-slim@sha256:b38f2881552c3054d140c8eeb4ad88bdc0eb4deeeb38507c5dac1403adc3ee64
   secretEnv: ['PLATFORM_API_KEY']
   script: |
     #!/usr/bin/env bash
