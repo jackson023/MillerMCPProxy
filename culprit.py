@@ -129,9 +129,27 @@ def frames_from_exc(exc: BaseException | None, repo_roots: Iterable[str], identi
     return out
 
 
+# [bug] #64833: platform wrappers that only pass a call through to a builtin (compile/exec/eval). Each catches its OWN
+# failures internally and falls back, so the only exception that leaves one is the wrapped builtin's (a SyntaxError in the
+# code being compiled) or the exec'd code's own (whose frames are deeper). The wrapper is never the culprit; the frame
+# that CALLED it is. Without this, culprit.compile_tool (#64760 gap 1) and every dyn_compile hook frame, which sit in
+# every stack, were blamed for a syntax error in the code they were handed.
+_PASSTHROUGH = frozenset({
+    ("culprit.py", "compile_tool"),
+    ("dyn_compile.py", "hooked_compile"),
+    ("dyn_compile.py", "hooked_exec"),
+    ("dyn_compile.py", "hooked_eval"),
+    ("dyn_compile.py", "_hooked"),
+})
+
+
+def _is_passthrough(f: dict) -> bool:
+    return (os.path.basename(f.get("file") or ""), f.get("function")) in _PASSTHROUGH
+
+
 def pick_culprit(frames: list[dict]) -> dict | None:
     for f in reversed(frames):
-        if f.get("in_app"):
+        if f.get("in_app") and not _is_passthrough(f):
             return f
     return None
 
@@ -321,6 +339,12 @@ def result_fingerprint(result: Any) -> str | None:
 
 
 _BARE_STATUS_RE = re.compile(r"^status=(?:error|partial)$")
+
+
+def is_bare_status_text(text: Any) -> bool:
+    """'status=error' / 'status=partial' with nothing else: says THAT something failed, never WHICH. Such a text must never
+    identify an error on its own (a fingerprint from result_fingerprint stands in for it)."""
+    return isinstance(text, str) and bool(_BARE_STATUS_RE.match(text.strip()))
 _RELAY_RE = re.compile(r"^tool reported status=(?:error|partial)")
 _EMPTY_DETAIL_RE = re.compile(r":\s*$")
 _EXC_TEXT_RE = re.compile(r"^[A-Z][A-Za-z]*(?:Error|Exception): ?\S")
