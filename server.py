@@ -1176,7 +1176,10 @@ async def _proxy(tool_name: str, arguments: dict, trace_id: str, use_request_key
     if tool_name == "gateway_canary_upstream":   # [bug] #64738: the live canary for the /execute 502 path
         _canary_upstream()
 
-    payload = {"tool_name": tool_name, "arguments": arguments or {}}
+    # Sign-in connector: on a /mcp-auth request the signed-in employee rides along as _actor_employee_id (S014).
+    # Every other request (all of /mcp) gets its arguments untouched.
+    payload = {"tool_name": tool_name,
+               "arguments": _oauth_thread_actor(arguments or {}) if use_request_key else (arguments or {})}
     headers = {
         "X-API-Key":         (_REQ_KEY.get() or API_KEY) if use_request_key else API_KEY,
         "X-Trace-Id":        trace_id,
@@ -1928,3 +1931,200 @@ async def admin_restart_info(service: str) -> JSONResponse:
         "allowed_services": sorted(_RESTARTABLE_SERVICES),
         "example": f"curl -X POST https://miller-mcp-gateway-146372550543.us-central1.run.app/admin/restart/{service} -H 'X-API-Key: <key>'",
     })
+
+
+# == S014  SIGN-IN CONNECTOR: OAuth 2.1 protected resource (/mcp-auth) =========
+# A second claude.ai connector, "MillerMCP (sign-in)", next to the ?api_key= one. Same tool surface as /mcp; the
+# credential is a WorkOS AuthKit access token instead of the platform key. Nothing in this section changes /mcp.
+#   GET  /.well-known/oauth-protected-resource[/mcp-auth]    RFC 9728 metadata naming the AuthKit issuer
+#   GET  /.well-known/oauth-authorization-server[/mcp-auth]  AuthKit's own metadata, relayed for older clients
+#   POST /mcp-auth  no or bad token -> 401 + WWW-Authenticate: Bearer resource_metadata="...". A good token (RS256
+#        against the AuthKit JWKS, iss == OAUTH_ISSUER, aud == OAUTH_RESOURCE, exp; see oauth_resource.py) goes to
+#        mcp_oauth_resolve_identity, which maps the subject to exactly one ACTIVE identity.employees row and writes
+#        one platform_event_log row (event_type mcp.oauth_request, payload.auth_method 'oauth'); refused -> 403,
+#        tool unreachable -> 503. Then the JSON-RPC body runs exactly as on /mcp, with the employee threaded to
+#        db-v3 as _actor_employee_id: the existing threaded-identity path in /execute (PI s28), not a new one.
+# Config (service.yaml): OAUTH_ISSUER (the AuthKit domain) and OAUTH_RESOURCE (this door's URL, the token audience).
+# Either unset = the door answers 503: closed, never open.
+import oauth_resource as _oauth  # noqa: E402
+
+OAUTH_ISSUER = os.environ.get("OAUTH_ISSUER", "").strip().rstrip("/")
+OAUTH_RESOURCE = os.environ.get("OAUTH_RESOURCE", "").strip()
+_OAUTH_ACTOR: _ContextVar = _ContextVar("_oauth_actor", default=None)
+_OAUTH_JWKS: dict = {"keys": {}, "fetched": 0.0}
+_OAUTH_JWKS_TTL_S = 3600
+_OAUTH_JWKS_MIN_REFETCH_S = 30     # an unknown kid refetches the JWKS at most this often (key rotation)
+_OAUTH_AS_META: dict = {"doc": None, "fetched": 0.0}
+_OAUTH_META_HEADERS = {"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"}
+
+
+def _oauth_configured() -> bool:
+    return OAUTH_ISSUER.startswith("https://") and OAUTH_RESOURCE.startswith("https://")
+
+
+def _oauth_thread_actor(arguments):
+    """_proxy calls this for request-keyed calls. On a /mcp-auth request the signed-in employee rides to db-v3 as
+    _actor_employee_id and any caller-supplied actor fields are dropped; elsewhere the arguments are returned as is."""
+    actor = _OAUTH_ACTOR.get()
+    if not actor:
+        return arguments
+    if not isinstance(arguments, dict):
+        # fail closed: without the threaded id db-v3 would fall back to the chat session's owner
+        raise RuntimeError("sign-in request with non-object tool arguments; refusing to forward without identity")
+    out = {k: v for k, v in arguments.items() if k not in ("_actor_employee_id", "_actor_session_id")}
+    out["_actor_employee_id"] = actor["employee_id"]
+    return out
+
+
+async def _oauth_keys(refresh: bool = False) -> dict:
+    now = time.monotonic()
+    age = now - _OAUTH_JWKS["fetched"]
+    if _OAUTH_JWKS["keys"] and age < _OAUTH_JWKS_TTL_S and not (refresh and age >= _OAUTH_JWKS_MIN_REFETCH_S):
+        return _OAUTH_JWKS["keys"]
+    keys = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            r = await client.get(OAUTH_ISSUER + "/oauth2/jwks")
+        if r.status_code == 200:
+            keys = _oauth.rsa_keys_from_jwks(r.json())
+        else:
+            logger.warning("oauth_jwks_fetch http=%d", r.status_code)
+    except Exception as exc:
+        logger.warning("oauth_jwks_fetch_failed err=%s", exc)
+    if keys:
+        _OAUTH_JWKS.update(keys=keys, fetched=now)
+    return _OAUTH_JWKS["keys"]
+
+
+async def _oauth_verify(request: Request) -> tuple:
+    """(claims, None, True) for a verified token, else (None, reason, token_was_presented). Never logs the token."""
+    bearer = _oauth.bearer_token(request.headers.get("authorization", ""))
+    if not bearer:
+        return None, "absent", False
+    keys = await _oauth_keys()
+    kid = _oauth.header_kid(bearer)
+    if kid and kid not in keys:
+        keys = await _oauth_keys(refresh=True)
+    if not keys:
+        return None, "jwks_unavailable", True
+    try:
+        claims = _oauth.verify_access_token(bearer, keys, issuer=OAUTH_ISSUER, audience=OAUTH_RESOURCE)
+        return claims, None, True
+    except _oauth.TokenError as exc:
+        return None, exc.reason, True
+
+
+def _oauth_unauthorized(request: Request, reason: str, presented: bool) -> JSONResponse:
+    # one deduped bus row per caller signature per hour (platform_audit_log, event gateway_auth_oauth_<reason>)
+    _record_auth_event(request, "/mcp-auth", "oauth_" + reason, "enforce")
+    challenge = _oauth.www_authenticate(OAUTH_RESOURCE, _oauth.RFC6750_BAD_TOKEN if presented else None,
+                                        reason if presented else None)
+    return JSONResponse(status_code=401, content={"error": "unauthorized", "reason": reason},
+                        headers={"WWW-Authenticate": challenge})
+
+
+def _oauth_rpc_summary(body) -> tuple:
+    methods, tools = [], []
+    for m in (body if isinstance(body, list) else [body])[:20]:
+        if not isinstance(m, dict):
+            continue
+        methods.append(str(m.get("method", ""))[:64])
+        if m.get("method") == "tools/call" and isinstance(m.get("params"), dict):
+            name = str(m["params"].get("name", ""))
+            inner = m["params"].get("arguments")
+            if name == "meta_tool" and isinstance(inner, dict) and inner.get("tool_name"):
+                name = "meta_tool:" + str(inner.get("tool_name"))
+            tools.append(name[:96])
+    return methods, tools
+
+
+async def _oauth_resolve(claims: dict, request: Request, methods: list, tools: list):
+    args = {
+        "sub": claims.get("sub"), "sid": claims.get("sid"),
+        "client_id": claims.get("client_id") or claims.get("azp"),
+        "trace_id": _wt_trace_id(), "rpc_methods": methods, "tool_names": tools,
+        "user_agent": request.headers.get("user-agent", "")[:200],
+        "ip": request.headers.get("x-forwarded-for", "").split(",")[0].strip()[:64],
+        "gateway_version": GW_VERSION,
+    }
+    try:
+        res = await _proxy("mcp_oauth_resolve_identity", args, _wt_trace_id(), use_request_key=False)
+    except Exception as exc:
+        logger.error("oauth_identity_call_failed err=%s", exc)
+        return None
+    return res.get("result", res) if isinstance(res, dict) else None
+
+
+@app.post("/mcp-auth")
+async def mcp_auth_post(request: Request) -> Response:
+    _upstream_hdrs.set(dict(request.headers))
+    _REQ_KEY.set("")            # always the gateway's own key upstream; the caller's credential is the token
+    _OAUTH_ACTOR.set(None)
+    if not _oauth_configured():
+        return JSONResponse(status_code=503, content={"error": "oauth_not_configured"})
+    claims, reason, presented = await _oauth_verify(request)
+    if claims is None:
+        if reason == "jwks_unavailable":
+            return JSONResponse(status_code=503, content={"error": "authorization_server_unavailable"})
+        return _oauth_unauthorized(request, reason, presented)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content=_err(None, -32700, "Parse error"))
+    methods, tools = _oauth_rpc_summary(body)
+    employee_id, why = _oauth.decide_identity(await _oauth_resolve(claims, request, methods, tools))
+    if employee_id is None:
+        if why == "identity_unavailable":
+            return JSONResponse(status_code=503, content={"error": "identity_unavailable"})
+        logger.warning("oauth_identity_refused sub=%s reason=%s", claims.get("sub"), why)
+        return JSONResponse(status_code=403, content={"error": "forbidden", "reason": why})
+    _OAUTH_ACTOR.set({"employee_id": employee_id, "sub": claims.get("sub")})
+    logger.info("mcp_auth_request employee_id=%s methods=%s tools=%s", employee_id, methods, tools)
+    if isinstance(body, list):
+        results = [r for item in body if (r := await _handle_single(item)) is not None]
+        return JSONResponse(content=results) if results else Response(status_code=202)
+    result = await _handle_single(body)
+    return JSONResponse(content=result) if result is not None else Response(status_code=202)
+
+
+@app.get("/mcp-auth")
+async def mcp_auth_get(request: Request) -> Response:
+    if not _oauth_configured():
+        return JSONResponse(status_code=503, content={"error": "oauth_not_configured"})
+    claims, reason, presented = await _oauth_verify(request)
+    if claims is None:
+        if reason == "jwks_unavailable":
+            return JSONResponse(status_code=503, content={"error": "authorization_server_unavailable"})
+        return _oauth_unauthorized(request, reason, presented)
+    return Response(status_code=405)    # like /mcp: POST only
+
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp-auth")
+async def oauth_protected_resource() -> JSONResponse:
+    if not _oauth_configured():
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    return JSONResponse(content=_oauth.protected_resource_metadata(OAUTH_RESOURCE, OAUTH_ISSUER),
+                        headers=_OAUTH_META_HEADERS)
+
+
+@app.get("/.well-known/oauth-authorization-server")
+@app.get("/.well-known/oauth-authorization-server/mcp-auth")
+async def oauth_authorization_server() -> JSONResponse:
+    if not _oauth_configured():
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    now = time.monotonic()
+    if _OAUTH_AS_META["doc"] is None or now - _OAUTH_AS_META["fetched"] > _OAUTH_JWKS_TTL_S:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+                r = await client.get(OAUTH_ISSUER + "/.well-known/oauth-authorization-server")
+            doc = r.json() if r.status_code == 200 else None
+            if isinstance(doc, dict) and doc.get("issuer") == OAUTH_ISSUER:
+                _OAUTH_AS_META.update(doc=doc, fetched=now)
+            else:
+                logger.warning("oauth_as_metadata_unexpected http=%d", r.status_code)
+        except Exception as exc:
+            logger.warning("oauth_as_metadata_fetch_failed err=%s", exc)
+    if _OAUTH_AS_META["doc"] is None:
+        return JSONResponse(status_code=502, content={"error": "authorization_server_unavailable"})
+    return JSONResponse(content=_OAUTH_AS_META["doc"], headers=_OAUTH_META_HEADERS)

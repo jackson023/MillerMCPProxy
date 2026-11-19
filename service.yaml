@@ -92,6 +92,12 @@ spec:
               name: miller-helper-api-key
         - name: MCP_AUTH_MODE
           value: warn
+        # Sign-in connector (/mcp-auth, server.py S014): the WorkOS AuthKit issuer and this door's own URL, which is
+        # the token audience (the Resource Indicator configured in WorkOS). Unset = /mcp-auth answers 503.
+        - name: OAUTH_ISSUER
+          value: https://efficient-soprano-22-staging.authkit.app
+        - name: OAUTH_RESOURCE
+          value: https://miller-mcp-gateway-146372550543.us-central1.run.app/mcp-auth
         - name: RUNNER_MASTER_SECRET
           valueFrom:
             secretKeyRef:
