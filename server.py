@@ -98,6 +98,7 @@ GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
 # counted as a compute grant (one enforcement point: httpx.AsyncClient.send, process-wide). The gateway has no
 # database: counts are flushed once a minute through db-v3 /execute -> work_ticket_ingest (runtime 'gateway').
 import work_ticket as _work_ticket  # noqa: E402
+import auth_shadow as _auth_shadow  # noqa: E402  [bug] #66018: shadow evaluation of DB-held keys (never decides)
 
 _work_ticket.RUNTIME = "gateway"
 _gw_ticket: _ContextVar[dict] = _ContextVar("_gw_ticket", default={})
@@ -554,11 +555,20 @@ def _record_auth_event(request: Request, route: str, state: str, mode: str) -> N
     task.add_done_callback(_bg_tasks.discard)
 
 
+async def _auth_shadow_send(rows: list) -> Any:
+    # [bug] #66018: no DB on the gateway request path; db-v3 compares and writes (api_key op=shadow_ingest).
+    return await _proxy("api_key", {"op": "shadow_ingest", "rows": rows}, _wt_trace_id(), use_request_key=False)
+
+
+_auth_shadow.configure(_auth_shadow_send)
+
+
 def _auth_gate(request: Request, route: str, *, allow_query: bool = False, mode: str = "enforce") -> bool:
     presented = _presented_key(request, allow_query)
     matched = _key_match(presented)
     if matched == "helper" and route not in ("/mcp", "/execute"):
         matched = ""  # a helper key opens /mcp and /execute only, never /admin/*
+    _auth_shadow.observe(route, presented, bool(matched))  # [bug] #66018: shadow only, never changes the verdict
     if matched not in ("current", "helper"):
         _record_auth_event(request, route, matched or ("invalid" if presented else "absent"), mode)
     _REQ_KEY.set(HELPER_KEY if matched == "helper" else "")
