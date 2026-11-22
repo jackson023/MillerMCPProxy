@@ -568,7 +568,7 @@ def _auth_gate(request: Request, route: str, *, allow_query: bool = False, mode:
     matched = _key_match(presented)
     if matched == "helper" and route not in ("/mcp", "/execute"):
         matched = ""  # a helper key opens /mcp and /execute only, never /admin/*
-    _auth_shadow.observe(route, presented, bool(matched))  # [bug] #66018: shadow only, never changes the verdict
+    _auth_shadow.observe(route, presented, bool(matched), _auth_shadow.request_context(request))  # [bug] #66018: shadow only, never changes the verdict
     if matched not in ("current", "helper"):
         _record_auth_event(request, route, matched or ("invalid" if presented else "absent"), mode)
     _REQ_KEY.set(HELPER_KEY if matched == "helper" else "")

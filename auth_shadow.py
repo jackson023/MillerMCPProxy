@@ -60,7 +60,7 @@ def fingerprint(presented):
     return hashlib.sha256(k.encode("utf-8")).hexdigest()
 
 
-def observe(route, presented, old_ok):
+def observe(route, presented, old_ok, ctx=None):
     """Queue one shadow comparison for this request. Never raises, never blocks, never changes the verdict."""
     try:
         if len(_buf) >= BUFFER_CAP:
@@ -72,6 +72,7 @@ def observe(route, presented, old_ok):
                 "scope": scope_for(route),
                 "old_verdict": bool(old_ok),
                 "key_sha256": fingerprint(presented),
+                "ctx": ctx if isinstance(ctx, dict) else {},
                 "service": SERVICE,
                 "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
             }
@@ -79,6 +80,61 @@ def observe(route, presented, old_ok):
         _kick()
     except Exception as exc:
         logger.warning("auth_shadow observe failed: %s", type(exc).__name__)
+
+
+_KEY_HEADERS = ("x-api-key", "x-agent-key", "x-pw-auth", "authorization")
+
+
+def request_context(request):
+    """Non-secret facts about the caller, for the shadow row. Never raises. No credential value, no query value:
+    query parameters are recorded as NAMES only, and a key presented in the URL is flagged, not stored."""
+    try:
+        h = request.headers
+        g = lambda k, n=200: ((h.get(k) or "")[:n]) or None
+        fwd = (h.get("x-forwarded-for") or "").strip()
+        qp = []
+        try:
+            qp = sorted({str(k)[:40] for k in request.query_params.keys()})[:10]
+        except Exception:
+            pass
+        key_header = ""
+        for k in _KEY_HEADERS:
+            if (h.get(k) or "").strip():
+                key_header = k
+                break
+        if not key_header and any(n in ("api_key", "key") for n in qp):
+            key_header = "query"
+        ip = (fwd.split(",")[0].strip() if fwd else "") or (getattr(getattr(request, "client", None), "host", "") or "")
+        ref = (h.get("referer") or "").split("?")[0][:160] or None
+        try:
+            cl = int(h.get("content-length")) if h.get("content-length") else None
+        except Exception:
+            cl = None
+        ctx = {
+            "user_agent": g("user-agent"),
+            "ip": ip[:64] or None,
+            "forwarded_chain": fwd[:200] or None,
+            "method": str(getattr(request, "method", "") or "")[:10] or None,
+            "path": str(getattr(getattr(request, "url", None), "path", "") or "")[:120] or None,
+            "query_params": qp,
+            "key_in_query": any(n in ("api_key", "key", "token") for n in qp),
+            "host": g("host", 120),
+            "origin": g("origin", 120),
+            "referer": ref,
+            "content_type": g("content-type", 60),
+            "content_length": cl,
+            "mcp_protocol_version": g("mcp-protocol-version", 20),
+            "mcp_session": bool(h.get("mcp-session-id")),
+            "cloud_trace": g("x-cloud-trace-context", 80),
+            "request_id": g("x-request-id", 64),
+            "has_authorization": bool((h.get("authorization") or "").strip()),
+            "has_cookie": bool(h.get("cookie")),
+            "has_assertion": bool(h.get("x-miller-assertion")),
+            "key_header": key_header,
+        }
+        return {k: v for k, v in ctx.items() if v not in (None, "")}
+    except Exception:
+        return {}
 
 
 def _kick():
