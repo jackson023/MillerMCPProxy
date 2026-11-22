@@ -79,11 +79,12 @@ spec:
               key: latest
               name: miller-platform-api-key
         # Bug 52545: dual-key acceptance. Holds "unset" outside a rotation window (see rotation runbook).
+        # Leaked key retired from this door (2026-11-22): reads a secret holding the unset sentinel.
         - name: API_KEY_SECONDARY
           valueFrom:
             secretKeyRef:
               key: latest
-              name: miller-platform-api-key-secondary
+              name: miller-platform-api-key-secondary-doors
         # Decision 53264: the helper AI key. Accepted on /mcp and /execute only; forwarded to db-v3 as the helper.
         - name: API_KEY_HELPER
           valueFrom:
