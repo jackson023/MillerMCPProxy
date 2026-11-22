@@ -90,8 +90,9 @@ spec:
             secretKeyRef:
               key: latest
               name: miller-helper-api-key
+        # Live value is enforce. Committed here so a deploy cannot silently revert it to warn.
         - name: MCP_AUTH_MODE
-          value: warn
+          value: enforce
         # Sign-in connector (/mcp-auth, server.py S014): the WorkOS AuthKit issuer and this door's own URL, which is
         # the token audience (the Resource Indicator configured in WorkOS). Unset = /mcp-auth answers 503.
         - name: OAUTH_ISSUER

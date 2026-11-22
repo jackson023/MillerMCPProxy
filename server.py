@@ -99,6 +99,7 @@ GCLOUD_RUNNER_EXEC  = f"{GCLOUD_RUNNER_URL}/execute"
 # database: counts are flushed once a minute through db-v3 /execute -> work_ticket_ingest (runtime 'gateway').
 import work_ticket as _work_ticket  # noqa: E402
 import auth_shadow as _auth_shadow  # noqa: E402  [bug] #66018: shadow evaluation of DB-held keys (never decides)
+import auth_db as _auth_db  # noqa: E402  key cutover: asks db-v3 whether a platform_api_keys key may pass (fail-safe)
 
 _work_ticket.RUNTIME = "gateway"
 _gw_ticket: _ContextVar[dict] = _ContextVar("_gw_ticket", default={})
@@ -513,8 +514,8 @@ def _presented_key(request: Request, allow_query: bool = False) -> str:
         auth = request.headers.get("authorization", "")
         if auth[:7].lower() == "bearer ":
             key = auth[7:].strip()
-    if not key and allow_query:
-        key = request.query_params.get("api_key", "")
+    # A key in the URL is never read (it lands in access logs: bug 66018). allow_query is kept so callers do not change;
+    # _auth_gate records a refused URL key so the caller can be found.
     return key
 
 
@@ -563,13 +564,26 @@ async def _auth_shadow_send(rows: list) -> Any:
 _auth_shadow.configure(_auth_shadow_send)
 
 
-def _auth_gate(request: Request, route: str, *, allow_query: bool = False, mode: str = "enforce") -> bool:
+async def _auth_db_send(key_sha256: str, scope: str) -> Any:
+    # Key cutover: only the sha256 and the scope go to db-v3 (api_key op=authorize); it answers accept=true only while
+    # platform_settings.auth_db_keys_mode is enforce.
+    return await _proxy("api_key", {"op": "authorize", "key_sha256": key_sha256, "scope": scope}, _wt_trace_id(), use_request_key=False)
+
+
+_auth_db.configure(_auth_db_send)
+
+
+async def _auth_gate(request: Request, route: str, *, allow_query: bool = False, mode: str = "enforce") -> bool:
     presented = _presented_key(request, allow_query)
     matched = _key_match(presented)
     if matched == "helper" and route not in ("/mcp", "/execute"):
         matched = ""  # a helper key opens /mcp and /execute only, never /admin/*
-    _auth_shadow.observe(route, presented, bool(matched), _auth_shadow.request_context(request))  # [bug] #66018: shadow only, never changes the verdict
-    if matched not in ("current", "helper"):
+    _auth_shadow.observe(route, presented, bool(matched), _auth_shadow.request_context(request))  # [bug] #66018: the shadow compares the OLD verdict
+    if not matched and presented and await _auth_db.accepts(presented, _auth_shadow.scope_for(route)):
+        matched = "db"  # a key from platform_api_keys; accepted only while auth_db_keys_mode is enforce
+    if allow_query and request.query_params.get("api_key"):
+        _record_auth_event(request, route, "query_key_refused", mode)
+    if matched not in ("current", "helper", "db"):
         _record_auth_event(request, route, matched or ("invalid" if presented else "absent"), mode)
     _REQ_KEY.set(HELPER_KEY if matched == "helper" else "")
     return bool(matched) or mode != "enforce"
@@ -1778,7 +1792,7 @@ async def mcp_post(request: Request) -> Response:
     _upstream_hdrs.set(raw_hdrs)
     # Bug 52545: /mcp gate. off = legacy no-check; warn = record unauthenticated callers, allow;
     # enforce = 401. Credential via X-API-Key, Authorization: Bearer, or ?api_key= (connector URLs).
-    if MCP_AUTH_MODE != "off" and not _auth_gate(request, "/mcp", allow_query=True, mode=MCP_AUTH_MODE):
+    if MCP_AUTH_MODE != "off" and not await _auth_gate(request, "/mcp", allow_query=True, mode=MCP_AUTH_MODE):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     _interesting = {
         k: v for k, v in raw_hdrs.items()
@@ -1858,7 +1872,7 @@ async def rest_execute(request: Request) -> Response:
     REST passthrough — proxies directly to db-v3 /execute.
     Preserves backward compatibility for any non-MCP callers.
     """
-    if not _auth_gate(request, "/execute"):
+    if not await _auth_gate(request, "/execute"):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     try:
         body = await request.json()
@@ -1914,7 +1928,7 @@ async def admin_restart(service: str, request: Request) -> JSONResponse:
     Bypasses db-v3 entirely -- routes through miller-gcloud-runner only.
     Example: curl -X POST https://<gateway>/admin/restart/miller-mcp-db-v3 -H 'X-API-Key: <key>'
     """
-    if not _auth_gate(request, "/admin/restart"):
+    if not await _auth_gate(request, "/admin/restart"):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     result = await _handle_restart_service({"service": service})
     return JSONResponse(
