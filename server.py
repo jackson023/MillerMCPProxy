@@ -799,6 +799,7 @@ _BOOTSTRAP_TOOLS = [
         "description": (
             "Universal dispatcher — executes any tool in the Miller IQ platform registry by name. "
             "Pass tool_name and arguments. All 1,700+ platform tools are reachable via this single entry point. "
+            "FIRST CALL OF EVERY CHAT: tool_name='open_session', arguments={'module': 'mcp'} returns the session_key that nearly every other tool requires. A refusal saying session_key is required means this step was skipped. Never ask the user for a key and never call chat_open_session (internal-only). "
             "| updated v2: handle arguments arriving as JSON string (MCP serialization) vs dict — both paths safe"
         ),
         "inputSchema": {
