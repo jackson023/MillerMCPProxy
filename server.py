@@ -1414,6 +1414,71 @@ async def _handle_tools_list(params: dict, req_id: Any) -> dict:
 
 _CONTEXT_TELEMETRY_TEXT_CAP = 60_000  # chars; bounds gateway->db-v3 telemetry payload size
 
+# [decision] PI retrieval step 2: the gateway is the one choke point that sees every
+# tool call, so tagged PI blocks (platform_pi_blocks.required_for = tool name) are
+# delivered here instead of in per-tool wrappers. Fail-open: any error -> no blocks.
+_PI_TAG_CACHE = {"at": -1e9, "tags": frozenset()}
+_PI_TAG_TTL_S = 60.0
+_PI_NEVER_INJECT = frozenset({"pi_context_gate", "pi_read", "open_session", "save_session"})
+_PI_API_HEADERS_NAME = "X-API-Key"
+
+
+def _pi_unwrap(body):
+    for _ in range(3):
+        if isinstance(body, dict) and isinstance(body.get("result"), dict):
+            body = body["result"]
+        else:
+            break
+    return body if isinstance(body, dict) else {}
+
+
+async def _pi_gate_post(client, args):
+    r = await client.post(
+        DB_V3_EXECUTE,
+        json={"tool_name": "pi_context_gate", "arguments": args},
+        headers={_PI_API_HEADERS_NAME: API_KEY, "Content-Type": "application/json"},
+    )
+    return _pi_unwrap(r.json())
+
+
+async def _pi_tool_tags(client):
+    import time as _pi_time
+
+    now = _pi_time.monotonic()
+    if now - _PI_TAG_CACHE["at"] < _PI_TAG_TTL_S:
+        return _PI_TAG_CACHE["tags"]
+    try:
+        got = await _pi_gate_post(client, {"op": "tool_tags"})
+        _PI_TAG_CACHE["tags"] = frozenset(got.get("tool_tags") or [])
+        _PI_TAG_CACHE["at"] = now
+    except Exception:
+        _PI_TAG_CACHE["at"] = now - _PI_TAG_TTL_S + 10.0  # retry in 10s, keep old tags
+    return _PI_TAG_CACHE["tags"]
+
+
+async def _pi_blocks_text(tool_name, arguments, sk):
+    """Text of the not-yet-delivered PI blocks tagged for this tool, else ''.
+    Untagged tools pay zero network calls (cached tag set)."""
+    inner = tool_name
+    if tool_name == "meta_tool" and isinstance(arguments, dict):
+        inner = str(arguments.get("tool_name") or "")
+    if not inner or not sk or inner in _PI_NEVER_INJECT or inner in _LOCAL_HANDLERS:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.0)) as c:
+            if inner not in await _pi_tool_tags(c):
+                return ""
+            gate = await _pi_gate_post(c, {"tool_name": inner, "session_key": sk})
+        blocks = gate.get("blocks_to_inject") or []
+        if not blocks:
+            return ""
+        parts = ["[PI blocks for %s]" % inner]
+        for b in blocks:
+            parts.append("### %s\n%s" % (b.get("heading") or b.get("block"), b.get("body") or ""))
+        return "\n\n".join(parts)
+    except Exception:
+        return ""
+
 
 async def _fire_context_telemetry(sk: str, tn: str, req_text: str, resp_text: str) -> None:
     """Fire-and-forget: record REAL tiktoken counts for context budget tracking.
@@ -1703,6 +1768,9 @@ async def _handle_tools_call(params: dict, req_id: Any) -> dict:
             _ct_task.add_done_callback(_bg_tasks.discard)
 
         content_blocks = [{"type": "text", "text": text}]
+        _pi_txt = await _pi_blocks_text(tool_name, arguments, _ct_sk)
+        if _pi_txt:
+            content_blocks.append({"type": "text", "text": _pi_txt})
         if _args_repairs:
             logger.warning("meta_tool arguments repaired tool=%s trace=%s repairs=%s", tool_name, trace_id, _args_repairs)
             content_blocks.append({"type": "text", "text": json.dumps({"_meta_tool_arguments_repaired": _args_repairs})})
